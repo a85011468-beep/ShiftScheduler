@@ -170,10 +170,9 @@ class ScheduleEngine:
                         tmr = all_eval_dates[i+2]
                         if tmr < eval_dates[0]: continue
                         
-                        just_started_working = model.NewBoolVar(f'just_started_{emp_id}_{today}')
-                        model.Add(just_started_working == 1).OnlyEnforceIf([is_off[(emp_id, ytd)], is_working[(emp_id, today)]])
-                        model.AddImplication(just_started_working, is_working[(emp_id, tmr)])
+                        # 💡 [已拔除] 休轉班必須 >= 2 天 (現在全面交由底下的 block_pref 扣分機制接管)
                         
+                        # 🚫 夜轉休必須 >= 2 天 (NIGHT_ONLY 族群除外，此健康防線依然保留)
                         if s_pref != 'NIGHT_ONLY':
                             just_started_off_after_night = model.NewBoolVar(f'night_to_off_{emp_id}_{today}')
                             model.Add(just_started_off_after_night == 1).OnlyEnforceIf([is_night[(emp_id, ytd)], is_off[(emp_id, today)]])

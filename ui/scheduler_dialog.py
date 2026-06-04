@@ -464,6 +464,7 @@ class SchedulerDialog(QDialog):
         self.settings.setValue("scheduler_start_date", start_date_str)
         self.settings.setValue("scheduler_end_date", end_date_str)
         super().closeEvent(event)
+        
     def on_save_pins_clicked(self):
         """將下拉選單中真正選定的班別釘上圖釘並保存"""
         start_date, end_date = self.get_selected_dates()
