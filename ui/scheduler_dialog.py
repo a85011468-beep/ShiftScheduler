@@ -1,11 +1,26 @@
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, 
                                QLabel, QDateEdit, QMessageBox, QFileDialog, QTableWidget, 
-                               QTableWidgetItem, QHeaderView, QSpinBox, QAbstractSpinBox) # 💡 新增這兩個
+                               QTableWidgetItem, QHeaderView, QSpinBox, QAbstractSpinBox,
+                               QComboBox) # 💡 新增 QComboBox
+
 from PySide6.QtCore import Qt, QDate, QSettings
 from PySide6.QtGui import QColor, QFont
 import pandas as pd
 from engine.solver import ScheduleEngine
 from config.settings import OFF_SHIFTS, ALL_STATES
+class CustomSpinBox(QSpinBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setButtonSymbols(QAbstractSpinBox.NoButtons) # 隱藏上下箭頭
+        # 💡 強制關閉滑鼠滾輪干擾，防止滑鼠滑過時意外滾動改變數字
+        self.setFocusPolicy(Qt.StrongFocus) 
+
+    def focusInEvent(self, event):
+        """重寫聚焦事件：當滑鼠移入或點擊時，不允許它自動全選文字"""
+        super().focusInEvent(event)
+        # 延遲取消全選，防止 Qt 預設行為干涉
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, self.lineEdit().deselect)
 
 class SchedulerDialog(QDialog):
     def __init__(self, db_manager, parent=None):
@@ -138,6 +153,7 @@ class SchedulerDialog(QDialog):
             return QColor(r, g, b)
 
     def refresh_table(self):
+        """讀取資料並依職級渲染預覽表格 (日期格全面升級下拉式選單，SpinBox優化)"""
         start_date, end_date = self.get_selected_dates()
         
         employees = self.db.get_all_active_employees()
@@ -147,12 +163,13 @@ class SchedulerDialog(QDialog):
             self.table.setColumnCount(0)
             return
 
-        self.leave_widgets = {} # 💡 存放 SpinBox 或 Label
+        self.leave_widgets = {} 
         self.remaining_labels = {} 
+        # 💡 [新增] 用來記錄所有日期格子下拉選單的字典，方便後續「釘圖釘」功能讀取
+        self.date_comboboxes = {} 
         
         level_dict = {str(e['emp_id']).strip(): str(e['job_level']).strip() for e in employees}
         name_dict = {str(e['emp_id']).strip(): e['name'] for e in employees}
-        # 💡 [新增] 讀取員工偏好
         shift_pref_dict = {str(e['emp_id']).strip(): str(e.get('shift_pref', 'MIX')).strip() for e in employees}
         emp_ids = [str(e['emp_id']).strip() for e in employees]
         
@@ -179,7 +196,6 @@ class SchedulerDialog(QDialog):
         sorted_emp_ids = sorted(pivot_df.index, key=sort_key)
         pivot_df = pivot_df.reindex(sorted_emp_ids)
 
-        # 💡 [擴充設定欄] 增加「固定(其他)」欄位
         settings_headers = ["特休(L)", "事假(P)", "中A班", "泛用01", "休息(r)", "例假(R)", "固定(其他)", "剩餘(天)"]
         all_headers = settings_headers + date_columns
         
@@ -191,29 +207,22 @@ class SchedulerDialog(QDialog):
         self.table.setVerticalHeaderLabels(y_labels)
 
         GENERIC_01_SHIFTS = ["01早B1", "01早B2", "01午B1", "01午B2"]
-        # 控制項的 KEY 列表
         control_keys = ['L', 'P', '01中A', '01泛用', 'r', 'R']
 
         # ==========================================
-        # ⚡ [第 0 列] 批次套用工具列
+        # ⚡ [第 0 列] 批次套用工具列 (改用優化過的 CustomSpinBox)
         # ==========================================
         def make_batch_updater(key):
             def update_all_emps(val):
                 for e_id, widgets in self.leave_widgets.items():
                     w = widgets.get(key)
-                    # 只有該欄位是 QSpinBox 且沒被反灰鎖死時，才允許批次更新
                     if isinstance(w, QSpinBox):
-                        if val >= w.minimum():
-                            w.setValue(val)
-                        else:
-                            w.setValue(w.minimum())
+                        w.setValue(val) if val >= w.minimum() else w.setValue(w.minimum())
             return update_all_emps
 
         for col_idx, key in enumerate(control_keys):
-            spin = QSpinBox()
+            spin = CustomSpinBox() # 💡 換成客製化無干擾版本
             spin.setRange(0, total_days)
-            spin.setButtonSymbols(QAbstractSpinBox.NoButtons) 
-            spin.setAlignment(Qt.AlignCenter)
             spin.setStyleSheet("background-color: #FFF9C4; color: black; font-weight: bold; border: 1px solid #ccc;")
             spin.valueChanged.connect(make_batch_updater(key))
             self.table.setCellWidget(0, col_idx, spin)
@@ -224,16 +233,12 @@ class SchedulerDialog(QDialog):
             item.setFlags(item.flags() & ~Qt.ItemIsEditable) 
             self.table.setItem(0, col_idx, item)
 
-
         # ==========================================
-        # 👥 [第 1 ~ N 列] 員工配額控制台
+        # 👥 [第 1 ~ N 列] 員工配額控制台與下拉選單班表
         # ==========================================
-        # 建立動態計算中心
         def make_updater(emp_id, lvl, pref, fixed_other, exist_gen01):
             def update():
                 widgets = self.leave_widgets[emp_id]
-                
-                # 讀取手動設定的數值
                 val_L = widgets['L'].value() if isinstance(widgets['L'], QSpinBox) else int(widgets['L'].text())
                 val_P = widgets['P'].value() if isinstance(widgets['P'], QSpinBox) else int(widgets['P'].text())
                 val_r = widgets['r'].value() if isinstance(widgets['r'], QSpinBox) else int(widgets['r'].text())
@@ -242,11 +247,9 @@ class SchedulerDialog(QDialog):
 
                 consumed = val_L + val_P + val_r + val_R + val_MidA + fixed_other
 
-                # 💡 [核心邏輯] 判斷「01泛用」該如何表現
                 if pref == 'NIGHT_ONLY':
                     val_Gen01 = 0
                 elif lvl == 'Normal':
-                    # 一般員工：自動補滿，讓剩餘天數歸零 (不低於已鎖定天數)
                     val_Gen01 = max(exist_gen01, total_days - consumed)
                     widgets['01泛用'].setText(str(val_Gen01))
                 else:
@@ -257,17 +260,12 @@ class SchedulerDialog(QDialog):
 
                 lbl_rem = self.remaining_labels[emp_id]
                 lbl_rem.setText(str(rem))
-
-                if rem < 0:
-                    lbl_rem.setStyleSheet("background-color: #FFCDD2; color: #B71C1C; font-weight: bold; border: 1px solid #B71C1C;")
-                else:
-                    lbl_rem.setStyleSheet("color: #1565C0; font-weight: bold; background-color: transparent;")
+                lbl_rem.setStyleSheet("color: #1565C0; font-weight: bold;" if rem >= 0 else "background-color: #FFCDD2; color: #B71C1C; font-weight: bold; border: 1px solid #B71C1C;")
             return update
 
         for row_idx, emp_id in enumerate(pivot_df.index):
             real_row = row_idx + 1 
             emp_data = pivot_df.loc[emp_id]
-            
             job_level = level_dict.get(emp_id, 'Normal')
             s_pref = shift_pref_dict.get(emp_id, 'MIX')
 
@@ -278,14 +276,13 @@ class SchedulerDialog(QDialog):
             existing_r = sum(emp_data == 'r')
             existing_R = sum(emp_data == 'R')
             
-            # 💡 計算「固定(其他)」：有值，且不屬於 L,P,中A,泛用,r,R 的班別 (例如主管班、Train、日)
             managed_states = ['L', 'P', '01中A', 'r', 'R'] + GENERIC_01_SHIFTS
             fixed_other = sum((emp_data != '') & (~emp_data.isin(managed_states)))
             
             self.leave_widgets[emp_id] = {}
+            self.date_comboboxes[emp_id] = {} # 初始化該員工的選單容器
             updater = make_updater(emp_id, job_level, s_pref, fixed_other, existing_Gen01)
 
-            # --- Widget 工廠函式 ---
             def create_label(col_idx, key, val, style="background-color: #EEEEEE; color: #9E9E9E; border: 1px solid #ccc;"):
                 lbl = QLabel(str(val))
                 lbl.setAlignment(Qt.AlignCenter)
@@ -294,67 +291,67 @@ class SchedulerDialog(QDialog):
                 self.leave_widgets[emp_id][key] = lbl
 
             def create_spinbox(col_idx, key, existing_val):
-                spin = QSpinBox()
+                spin = CustomSpinBox() # 💡 換成客製化無干擾版本
                 spin.setRange(existing_val, total_days) 
                 spin.setValue(existing_val)
                 spin.setAlignment(Qt.AlignCenter)
-                spin.setButtonSymbols(QAbstractSpinBox.NoButtons) 
                 spin.setStyleSheet("background-color: white; color: black; border: 1px solid #ddd;")
                 spin.valueChanged.connect(updater) 
                 self.table.setCellWidget(real_row, col_idx, spin)
                 self.leave_widgets[emp_id][key] = spin
 
-            # --- 開始依據規則佈署格子 ---
             create_spinbox(0, 'L', existing_L)
             create_spinbox(1, 'P', existing_P)
             
-            # 01中A：NIGHT_ONLY 反灰歸 0，否則 SpinBox
-            if s_pref == 'NIGHT_ONLY':
-                create_label(2, '01中A', 0)
-            else:
-                create_spinbox(2, '01中A', existing_MidA)
+            if s_pref == 'NIGHT_ONLY': create_label(2, '01中A', 0)
+            else: create_spinbox(2, '01中A', existing_MidA)
                 
-            # 01泛用：NIGHT_ONLY 歸 0，Normal 動態反灰，M/Chief 為 SpinBox
-            if s_pref == 'NIGHT_ONLY':
-                create_label(3, '01泛用', 0)
-            elif job_level == 'Normal':
-                create_label(3, '01泛用', existing_Gen01, style="background-color: #E3F2FD; color: #1565C0; font-weight: bold; border: 1px solid #ccc;")
-            else:
-                create_spinbox(3, '01泛用', existing_Gen01)
+            if s_pref == 'NIGHT_ONLY': create_label(3, '01泛用', 0)
+            elif job_level == 'Normal': create_label(3, '01泛用', existing_Gen01, style="background-color: #E3F2FD; color: #1565C0; font-weight: bold; border: 1px solid #ccc;")
+            else: create_spinbox(3, '01泛用', existing_Gen01)
 
             create_spinbox(4, 'r', existing_r)
             create_spinbox(5, 'R', existing_R)
-
-            # 固定(其他)
             create_label(6, '固定(其他)', fixed_other)
 
-            # 剩餘(天)
             rem_label = QLabel()
             rem_label.setAlignment(Qt.AlignCenter)
             self.table.setCellWidget(real_row, 7, rem_label)
             self.remaining_labels[emp_id] = rem_label
-            
-            # 初始化觸發一次計算
             updater() 
 
-            # 渲染後方的日期資料格
+            # 💡 [核心修改] 將右側日期格子全部渲染為 QComboBox 下拉選單
+            # 選單元素清單：最前面留一個空字串代表尚未排班，後面接上系統合法的 ALL_STATES
+            combo_items = [""] + ALL_STATES
+
             for col_offset, date in enumerate(date_columns):
-                val = pivot_df.at[emp_id, date]
-                item = QTableWidgetItem(str(val))
-                item.setTextAlignment(Qt.AlignCenter)
+                val = str(pivot_df.at[emp_id, date]).strip()
                 
-                if val: item.setBackground(Qt.lightGray)
-                if val and val not in ALL_STATES:
-                    item.setBackground(QColor("#FFCDD2")) 
-                    item.setForeground(QColor("#B71C1C")) 
+                combo = QComboBox()
+                combo.addItems(combo_items)
                 
-                self.table.setItem(real_row, col_offset + len(settings_headers), item)
+                # 如果資料庫原本就有值，將下拉選單切換到對應的位置
+                if val in combo_items:
+                    combo.setCurrentText(val)
+                else:
+                    combo.setCurrentIndex(0) # 查無此班別（髒資料）一律強制歸空，洗滌乾淨
+                
+                # 美化下拉選單樣式，使其像儲存格一樣乾淨
+                if val:
+                    combo.setStyleSheet("background-color: #E0E0E0; color: black; border: none;")
+                else:
+                    combo.setStyleSheet("background-color: white; color: black; border: none;")
+                
+                table_col = col_offset + len(settings_headers)
+                self.table.setCellWidget(real_row, table_col, combo)
+                
+                # 存入字典中，供稍後的「釘圖釘」按鈕回撈資料
+                self.date_comboboxes[emp_id][date] = combo
 
         # ==========================================
         # 👑 [最後一列] 每日出勤統計
         # ==========================================
         last_row_idx = len(pivot_df) + 1
-        
         for i in range(len(settings_headers)):
             item = QTableWidgetItem("")
             item.setBackground(QColor("#E0E0E0"))
@@ -368,24 +365,20 @@ class SchedulerDialog(QDialog):
             item = QTableWidgetItem(f"{work_count} 人")
             item.setTextAlignment(Qt.AlignCenter)
             item.setFlags(item.flags() & ~Qt.ItemIsEditable) 
-            
             item.setBackground(self._get_gradient_color(work_count))
             item.setForeground(QColor("#000000"))
             font = QFont()
             font.setBold(True)
             font.setPointSize(14)
             item.setFont(font)
-            
             self.table.setItem(last_row_idx, col_idx + len(settings_headers), item)
 
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.table.horizontalHeader().setDefaultSectionSize(75)
         self.table.verticalHeader().setDefaultSectionSize(40)
-        
         for i in range(len(settings_headers)):
             self.table.horizontalHeader().resizeSection(i, 60)
-
 
     def on_run_engine_clicked(self):
         start_date, end_date = self.get_selected_dates()
@@ -472,47 +465,52 @@ class SchedulerDialog(QDialog):
         self.settings.setValue("scheduler_end_date", end_date_str)
         super().closeEvent(event)
     def on_save_pins_clicked(self):
-        """將畫面上手動輸入的班別 (如 L, Train) 儲存並釘上圖釘"""
+        """將下拉選單中真正選定的班別釘上圖釘並保存"""
         start_date, end_date = self.get_selected_dates()
-        
-        if self.db.is_period_locked(start_date, end_date):
-            QMessageBox.critical(self, "🛑 拒絕寫入", "該區間已被系統結算鎖定，無法新增圖釘。")
-            return
-
-        records_to_update = []
-        
-        # 取得所有員工 ID 與日期欄位 (跳過前面兩個 L/P 設定欄位)
         date_columns = pd.date_range(start=start_date, end=end_date).strftime('%Y-%m-%d').tolist()
         
-        for row_idx in range(self.table.rowCount()):
-            # 取得垂直標籤 (emp_id 姓名) 並抽出 emp_id
-            v_header = self.table.verticalHeaderItem(row_idx).text()
-            emp_id = v_header.split(" ")[0]
-            
-            for col_idx, date in enumerate(date_columns):
-                # 表格中的日期從第 3 欄 (index 2) 開始
-                item = self.table.item(row_idx, col_idx + 2)
-                if item:
-                    val = item.text().strip()
-                    # 💡 只有當格子內有您手動輸入的值 (例如 L, Train) 時，才執行寫入並鎖定
-                    if val:
-                        records_to_update.append((emp_id, date, val, 1))
-
-        if not records_to_update:
-            QMessageBox.information(self, "無更新", "您沒有在畫面上輸入任何新的手動班別。")
+        employees = self.db.get_all_active_employees()
+        if not employees: 
             return
-
+        
+        level_dict = {str(e['emp_id']).strip(): str(e['job_level']).strip() for e in employees}
+        def sort_key(emp_id):
+            level = level_dict.get(str(emp_id), 'Normal')
+            if level == 'Chief': return (0, str(emp_id))
+            elif level == 'M': return (1, str(emp_id))
+            else: return (2, str(emp_id))
+            
+        sorted_emp_ids = sorted([str(e['emp_id']).strip() for e in employees], key=sort_key)
+        
+        pinned_count = 0
         conn = self.db.get_connection()
         cursor = conn.cursor()
-        cursor.executemany('''
-            INSERT INTO schedule (emp_id, date, shift_code, is_locked)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(emp_id, date) DO UPDATE SET 
-                shift_code = excluded.shift_code,
-                is_locked = excluded.is_locked
-        ''', records_to_update)
+        
+        for emp_id in sorted_emp_ids:
+            for date_str in date_columns:
+                # 💡 從我們的下拉選單容器中，把對應的 QComboBox 拿出來
+                combo = self.date_comboboxes.get(emp_id, {}).get(date_str)
+                
+                if combo:
+                    shift_code = combo.currentText().strip()
+                    
+                    if shift_code: # 只有當選單不是選「空字串」時，才代表主管要親自釘上這個班別
+                        cursor.execute("""
+                            UPDATE schedule 
+                            SET is_locked = 1, shift_code = ?
+                            WHERE emp_id = ? AND date = ?
+                        """, (shift_code, emp_id, date_str))
+                        pinned_count += 1
+                    else:
+                        # 💡 防呆加強：如果主管把原本有班的選單改選為「空字串」，主動解鎖圖釘
+                        cursor.execute("""
+                            UPDATE schedule 
+                            SET is_locked = 0, shift_code = NULL
+                            WHERE emp_id = ? AND date = ? AND is_locked = 1
+                        """, (emp_id, date_str))
+                        
         conn.commit()
         conn.close()
         
-        QMessageBox.information(self, "圖釘釘入成功", f"✅ 已成功將 {len(records_to_update)} 筆手動班別寫入資料庫並鎖定。\n引擎下次排班將會絕對服從這些紀錄。")
+        QMessageBox.information(self, "鎖定完成", f"成功將 {pinned_count} 個選擇的預排班別釘上圖釘！")
         self.refresh_table()
