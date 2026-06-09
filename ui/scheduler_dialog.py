@@ -77,11 +77,11 @@ class SchedulerDialog(QDialog):
 
         self.btn_import_pre = QPushButton("📥 匯入預排 (Excel)")
         self.btn_import_pre.clicked.connect(self.on_import_pre_schedule_clicked)
-        self.button_layout.addWidget(self.btn_import_pre)
+        ctrl_layout.addWidget(self.btn_import_pre)
         
         self.btn_clear_pre = QPushButton("🗑️ 清除區間預排")
         self.btn_clear_pre.clicked.connect(self.on_clear_pre_schedule_clicked)
-        self.button_layout.addWidget(self.btn_clear_pre)
+        ctrl_layout.addWidget(self.btn_clear_pre)
 
         # 3. 🔧 [功能二] 新增「刪除未來班表」按鈕
         self.btn_clear = QPushButton("🗑️ 清空區間未鎖定班表")
