@@ -23,6 +23,106 @@ class ScheduleEngine:
         conn.commit()
         conn.close()
 
+    def _run_pre_flight_diagnostics(self, emp_ids, eval_dates, dict_sched, dict_history, job_levels, shift_prefs, leave_quotas):
+        diagnostics = []
+        
+        # 1. 建立全局鎖定看板 (合併歷史紀錄與未來的圖釘)
+        locked_board = {}
+        for (emp_id, d), shift in dict_history.items():
+            locked_board[(emp_id, d)] = shift
+        for (emp_id, d), record in dict_sched.items():
+            if record['is_locked'] == 1:
+                locked_board[(emp_id, d)] = record['shift_code']
+                
+        all_eval_dates = sorted(list(set([d for _, d in locked_board.keys()] + eval_dates)))
+
+        # ==========================================
+        # 🛡️ 檢核 1：最大人數上限 (max_req) 衝突
+        # ==========================================
+        for date in eval_dates:
+            daily_counts = {}
+            for emp_id in emp_ids:
+                shift = locked_board.get((emp_id, date))
+                if shift:
+                    daily_counts[shift] = daily_counts.get(shift, 0) + 1
+            for shift, count in daily_counts.items():
+                if shift in SHIFT_DEMANDS:
+                    max_req = SHIFT_DEMANDS[shift][1]
+                    if count > max_req:
+                        diagnostics.append(f"[{date}] 「{shift}」被人工圖釘鎖定 {count} 人，已超過每日需求上限 {max_req} 人。")
+
+        # ==========================================
+        # 🛡️ 檢核 2：交接班時序衝突 (午接早、夜接早)
+        # ==========================================
+        for emp_id in emp_ids:
+            eid = str(emp_id).strip()
+            for i in range(len(all_eval_dates) - 1):
+                today = all_eval_dates[i]
+                tmr = all_eval_dates[i+1]
+                if tmr not in eval_dates: continue # 只檢核會影響未來排班的邊界
+                
+                shift_today = locked_board.get((emp_id, today))
+                shift_tmr = locked_board.get((emp_id, tmr))
+                if shift_today and shift_tmr:
+                    if shift_today in NOON_SHIFTS and shift_tmr in FORBIDDEN_AFTER_NOON:
+                        diagnostics.append(f"[{today}跨{tmr}] {eid} 圖釘違規：午班不可接早班。")
+                    if shift_today in NIGHT_SHIFTS and shift_tmr in FORBIDDEN_AFTER_NIGHT:
+                        diagnostics.append(f"[{today}跨{tmr}] {eid} 圖釘違規：夜班下莊不可接早午班。")
+
+        # ==========================================
+        # 🛡️ 檢核 3：七休一連班違規
+        # ==========================================
+        for emp_id in emp_ids:
+            eid = str(emp_id).strip()
+            for i in range(len(all_eval_dates) - 6):
+                window = [all_eval_dates[i+j] for j in range(7)]
+                if not any(d in eval_dates for d in window): continue
+                
+                locked_work = sum(1 for d in window if locked_board.get((emp_id, d)) in WORK_SHIFTS or locked_board.get((emp_id, d)) in ['L', 'P'])
+                if locked_work == 7:
+                    diagnostics.append(f"[{window[0]}至{window[-1]}] {eid} 被連續圖釘鎖死 7 天無休息日，違反七休一。")
+
+        # ==========================================
+        # 🛡️ 檢核 4 & 5：靜態週一例 (R==1) 與配額死結
+        # ==========================================
+        weeks_dict = {}
+        for d_str in all_eval_dates:
+            d_obj = datetime.strptime(d_str, '%Y-%m-%d')
+            days_since_sun = (d_obj.weekday() + 1) % 7 
+            sun_date = d_obj - timedelta(days=days_since_sun)
+            sun_str = sun_date.strftime('%Y-%m-%d')
+            if sun_str not in weeks_dict: weeks_dict[sun_str] = []
+            weeks_dict[sun_str].append(d_str)
+
+        for emp_id in emp_ids:
+            eid = str(emp_id).strip()
+            required_Rs = 0
+            
+            for sun_str, week_dates in weeks_dict.items():
+                if len(week_dates) == 7 and any(d >= eval_dates[0] for d in week_dates):
+                    # 檢核 4：單週被釘了超過 1 個 R
+                    locked_Rs = sum(1 for d in week_dates if locked_board.get((emp_id, d)) == 'R')
+                    if locked_Rs > 1:
+                        diagnostics.append(f"[{sun_str}週] {eid} 該週被鎖定了 {locked_Rs} 天例假(R)，違反「每週僅能1例」規定。")
+                    
+                    # 計算引擎在這週「被迫」一定要排幾個 R
+                    has_history_R = any(locked_board.get((emp_id, d)) == 'R' for d in week_dates if d < eval_dates[0])
+                    if not has_history_R:
+                        required_Rs += 1
+
+            # 檢核 5：QSpinBox 總配額不足以應付法律底線
+            q = leave_quotas.get(eid, {})
+            r1 = int(q.get('R', 0))
+            r2 = int(q.get('R2', 0))
+            user_R_quota = r1 + r2
+            
+            if user_R_quota < required_Rs:
+                diagnostics.append(f"[配額死結] {eid} 依法必須排 {required_Rs} 天例假(R)。但系統讀到的設定配額僅 {user_R_quota} 天 (期內讀到 {r1} 天，跨出讀到 {r2} 天)。請確認 QSpinBox 總和。")
+
+        # 回傳去重複的錯誤清單
+        return list(set(diagnostics))
+
+
     def run_scheduler(self, start_date, end_date, leave_quotas=None, split_date=None):
         if leave_quotas is None: leave_quotas = {}
         
@@ -47,6 +147,20 @@ class ScheduleEngine:
         history_end = (eval_start_dt - timedelta(days=1)).strftime('%Y-%m-%d')
         history_schedules = self.db.get_schedule_by_date_range(history_start, history_end)
         dict_history = {(s['emp_id'], s['date']): s['shift_code'] for s in history_schedules}
+
+        # =========================================================================
+        # 🚀 啟動硬規則飛行前安檢 (Pre-flight Diagnostics)
+        # =========================================================================
+        print("🔍 啟動硬規則飛行前安檢...")
+        hard_conflicts = self._run_pre_flight_diagnostics(emp_ids, eval_dates, dict_sched, dict_history, job_levels, shift_prefs, leave_quotas)
+        
+        if hard_conflicts:
+            error_msg = "❌ 引擎安檢未通過！偵測到無法解開的「硬規則死結」：\n\n"
+            error_msg += "👉 " + "\n👉 ".join(hard_conflicts[:8])
+            if len(hard_conflicts) > 8:
+                error_msg += f"\n\n...等共 {len(hard_conflicts)} 項衝突。"
+            error_msg += "\n\n💡 引擎已被攔截保護。請至排班面板調整「特休配額」或解除衝突的「圖釘鎖定」。"
+            return False, error_msg
 
         def attempt_solve(strict_time_rules=True, strict_quotas=True):
             model = cp_model.CpModel()
@@ -85,7 +199,7 @@ class ScheduleEngine:
                                 if w_shift not in NIGHT_SHIFTS:
                                     model.Add(works[(emp_id, date, w_shift)] == 0)
 
-# =========================================================================
+            # =========================================================================
             # 2. 每日需求、複合戰力 與 🚑 虛擬人力 (Slack Variables)
             # =========================================================================
             virtual_penalties = []
@@ -117,13 +231,41 @@ class ScheduleEngine:
                 virtual_penalties.append(slack_noon * 1000000)
                 virtual_vars_dict[(date, '午班複合戰力')] = slack_noon
 
+            # =========================================================================
+            # 2.5 🚑 加班 (O) 轉換邏輯：將指定的加班額度強制指派為特定工作班別
+            # =========================================================================
+            is_overtime_vars = {}
+            for emp_id in emp_ids:
+                eid = str(emp_id).strip()
+                s_pref = shift_prefs.get(eid, 'MIX')
+                
+                # 💡 判斷加班允許的班別 (Night_only 特例處理)
+                if s_pref == 'NIGHT_ONLY':
+                    allowed_ot_shifts = ['01夜B1', '01夜B2']
+                else:
+                    allowed_ot_shifts = ['01早B1', '01午B1', '01中A', '01早m', '01午m']
+                
+                for d in eval_dates:
+                    is_ot = model.NewBoolVar(f'is_ot_{eid}_{d}')
+                    is_overtime_vars[(emp_id, d)] = is_ot
+                    
+                    # 篩選出該員工確實能上的允許班別
+                    allowed_vars = [works[(emp_id, d, s)] for s in allowed_ot_shifts if (emp_id, d, s) in works]
+                    
+                    if allowed_vars:
+                        # 💡 如果這天被選為「加班日」(is_ot == 1)，那當天班別必須是上述允許的其中之一
+                        model.Add(sum(allowed_vars) == 1).OnlyEnforceIf(is_ot)
+                    else:
+                        model.Add(is_ot == 0)
+
+            # =========================================================================
             # 3. 測試變因宇宙 A：QSpinBox 絕對鎖死 (硬限制開關)
+            # =========================================================================
             if strict_quotas:
                 for emp_id in emp_ids:
                     eid = str(emp_id).strip()
                     q = leave_quotas.get(eid, {})
                     
-                    # 💡 如果有跨越八週邊界，分別對兩個區間進行配額約束
                     if split_date and eval_dates[0] <= split_date < eval_dates[-1]:
                         p1_dates = [d for d in eval_dates if d <= split_date]
                         p2_dates = [d for d in eval_dates if d > split_date]
@@ -133,18 +275,24 @@ class ScheduleEngine:
                         model.Add(sum(works[(emp_id, d, 'P')] for d in p1_dates) == q.get('P', 0))
                         model.Add(sum(works[(emp_id, d, 'r')] for d in p1_dates) == q.get('r', 0))
                         model.Add(sum(works[(emp_id, d, 'R')] for d in p1_dates) == q.get('R', 0))
+                        # 💡 強制配發期內加班日數
+                        model.Add(sum(is_overtime_vars[(emp_id, d)] for d in p1_dates) == q.get('O', 0))
                         
                         # 區間 2 (跨出) 限制
                         model.Add(sum(works[(emp_id, d, 'L')] for d in p2_dates) == q.get('L2', 0))
                         model.Add(sum(works[(emp_id, d, 'P')] for d in p2_dates) == q.get('P2', 0))
                         model.Add(sum(works[(emp_id, d, 'r')] for d in p2_dates) == q.get('r2', 0))
                         model.Add(sum(works[(emp_id, d, 'R')] for d in p2_dates) == q.get('R2', 0))
+                        # 💡 強制配發跨出加班日數
+                        model.Add(sum(is_overtime_vars[(emp_id, d)] for d in p2_dates) == q.get('O2', 0))
                     else:
-                        # 💡 未跨界的常規單一約束
+                        # 未跨界的常規單一約束
                         model.Add(sum(works[(emp_id, d, 'L')] for d in eval_dates) == q.get('L', 0))
                         model.Add(sum(works[(emp_id, d, 'P')] for d in eval_dates) == q.get('P', 0))
                         model.Add(sum(works[(emp_id, d, 'r')] for d in eval_dates) == q.get('r', 0))
                         model.Add(sum(works[(emp_id, d, 'R')] for d in eval_dates) == q.get('R', 0))
+                        # 💡 強制配發總加班日數
+                        model.Add(sum(is_overtime_vars[(emp_id, d)] for d in eval_dates) == q.get('O', 0))
                     
                     # 💡 [移除] 把 01中A 和 01泛用 的強迫配額刪除！
                     # 引擎現在可以為了大局，自由地把中A和泛用發放給合適的員工。

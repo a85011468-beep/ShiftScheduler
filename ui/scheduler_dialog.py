@@ -200,7 +200,7 @@ class SchedulerDialog(QDialog):
         pivot_df = pivot_df.reindex(sorted_emp_ids)
 
         # ==========================================
-        # 🎯 跨期邊界偵測與左右佈局拆分
+        # 🎯 跨期邊界偵測與左右佈局拆分 (加入 加班 O 欄位)
         # ==========================================
         self.split_date = None
         saved_audit = self.settings.value("audit_start_date", "")
@@ -215,19 +215,17 @@ class SchedulerDialog(QDialog):
 
         # 💡 [UI 優化] 把期內放左邊，期外放右邊
         if self.split_date:
-            headers_left = ["L(期內)", "P(期內)", "r(期內)", "R(期內)", "固定(其他)", "剩餘(內)"]
-            headers_right = ["L(跨出)", "P(跨出)", "r(跨出)", "R(跨出)", "剩餘(外)"]
-            self.control_keys_left = ['L', 'P', 'r', 'R']
-            self.control_keys_right = ['L2', 'P2', 'r2', 'R2']
-            
+            headers_left = ["L(期內)", "P(期內)", "r(期內)", "R(期內)", "加班(O內)", "固定", "剩餘(內)"]
+            headers_right = ["L(跨出)", "P(跨出)", "r(跨出)", "R(跨出)", "加班(O外)", "剩餘(外)"]
+            self.control_keys_left = ['L', 'P', 'r', 'R', 'O']
+            self.control_keys_right = ['L2', 'P2', 'r2', 'R2', 'O2']
             p1_dates = [d for d in date_columns if d <= self.split_date]
             p2_dates = [d for d in date_columns if d > self.split_date]
         else:
-            headers_left = ["特休(L)", "事假(P)", "休息(r)", "例假(R)", "固定(其他)", "剩餘(天)"]
+            headers_left = ["特休(L)", "事假(P)", "休息(r)", "例假(R)", "加班(O)", "固定", "剩餘(天)"]
             headers_right = []
-            self.control_keys_left = ['L', 'P', 'r', 'R']
+            self.control_keys_left = ['L', 'P', 'r', 'R', 'O']
             self.control_keys_right = []
-            
             p1_dates = date_columns
             p2_dates = []
 
@@ -354,16 +352,17 @@ class SchedulerDialog(QDialog):
                 self.table.setCellWidget(real_row, col_idx, spin)
                 self.leave_widgets[emp_id][key] = spin
 
-            # 左側元件 (期內)
+            # 左側元件 (期內) - 💡 加入索引 4 的 O
             create_spinbox(0, 'L', sum(emp_p1 == 'L'), total_days_p1)
             create_spinbox(1, 'P', sum(emp_p1 == 'P'), total_days_p1)
             create_spinbox(2, 'r', sum(emp_p1 == 'r'), total_days_p1)
             create_spinbox(3, 'R', sum(emp_p1 == 'R'), total_days_p1)
-            create_label(4, '固定(其他)', fixed_p1)
+            create_spinbox(4, 'O', 0, total_days_p1) 
+            create_label(5, '固定(其他)', fixed_p1)
 
             rem_label_p1 = QLabel()
             rem_label_p1.setAlignment(Qt.AlignCenter)
-            self.table.setCellWidget(real_row, 5, rem_label_p1)
+            self.table.setCellWidget(real_row, 6, rem_label_p1)
             self.remaining_labels[f"{emp_id}_p1"] = rem_label_p1
 
             # 中間網格 (日期)
@@ -388,10 +387,11 @@ class SchedulerDialog(QDialog):
                 create_spinbox(r_start + 1, 'P2', sum(emp_p2 == 'P'), total_days_p2)
                 create_spinbox(r_start + 2, 'r2', sum(emp_p2 == 'r'), total_days_p2)
                 create_spinbox(r_start + 3, 'R2', sum(emp_p2 == 'R'), total_days_p2)
+                create_spinbox(r_start + 4, 'O2', 0, total_days_p2)
 
                 rem_label_p2 = QLabel()
                 rem_label_p2.setAlignment(Qt.AlignCenter)
-                self.table.setCellWidget(real_row, r_start + 4, rem_label_p2)
+                self.table.setCellWidget(real_row, r_start + 5, rem_label_p2)
                 self.remaining_labels[f"{emp_id}_p2"] = rem_label_p2
 
             # 強制第一次計算與繪製
@@ -488,30 +488,41 @@ class SchedulerDialog(QDialog):
             
     def on_run_engine_clicked(self):
         start_date, end_date = self.get_selected_dates()
-        
         leave_quotas = {}
-        for emp_id, widgets in self.leave_widgets.items():
-            def get_val(key):
-                w = widgets.get(key)
-                if w is None: return 0
-                return w.value() if isinstance(w, QSpinBox) else int(w.text())
-
-            # 💡 [修改] 只抽取休假資料傳給引擎
-            leave_quotas[emp_id] = {
-                'L': get_val('L'),
-                'P': get_val('P'),
-                'r': get_val('r'),
-                'R': get_val('R')
-            }
+        
+        # 🛡️ 安全取得左右兩側的 keys，確保不會因為重新整理狀態丟失而落空
+        all_keys = getattr(self, 'control_keys_left', ['L', 'P', 'r', 'R'])
+        if getattr(self, 'split_date', None):
+            all_keys += getattr(self, 'control_keys_right', ['L2', 'P2', 'r2', 'R2'])
             
+        for emp_id, widgets in self.leave_widgets.items():
+            leave_quotas[emp_id] = {}
+            for k in all_keys:
+                w = widgets.get(k)
+                if w is not None:
+                    try:
+                        # 💡 迴避 PyQt 的繼承陷阱，直接暴力取值
+                        val = w.value() 
+                    except AttributeError:
+                        try:
+                            val = int(w.text())
+                        except (ValueError, TypeError):
+                            val = 0
+                    leave_quotas[emp_id][k] = val
+                else:
+                    leave_quotas[emp_id][k] = 0
+                    
         engine = ScheduleEngine(self.db)
-        success, message = engine.run_scheduler(start_date, end_date, leave_quotas)
+        # 將捕捉到的精準配額交給引擎
+        success, message = engine.run_scheduler(start_date, end_date, leave_quotas, split_date=getattr(self, 'split_date', None))
+        
         if success:
             QMessageBox.information(self, "排班結果", message)
             self.refresh_table() 
         else:
             QMessageBox.warning(self, "排班失敗", message)
-            
+
+
     # 🔧 [功能二] 實作安全刪除邏輯
     def on_clear_schedule_clicked(self):
         """清空選定區間內所有未鎖定的排班資料"""
