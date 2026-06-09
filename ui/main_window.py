@@ -5,6 +5,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, Q
 from PySide6.QtCore import Qt, QDate, QSettings
 from PySide6.QtGui import QColor, QFont
 import pandas as pd
+from datetime import datetime
 from database.db_manager import DatabaseManager
 from database.data_importer import DataImporter
 from ui.db_dialog import DatabaseManagerDialog
@@ -210,9 +211,29 @@ class MainWindow(QMainWindow):
 
         self.table.setRowCount(len(pivot_df) + 1)
         self.table.setColumnCount(len(pivot_df.columns))
-        self.table.setHorizontalHeaderLabels(pivot_df.columns)
-        
-        # 💡 [位置互換] 將統計標籤移到陣列的最後面
+        # 設定欄位標題（含週日紅色高亮）
+
+        headers = list(pivot_df.columns)
+        self.table.setHorizontalHeaderLabels(headers)
+
+        for col_idx, header_text in enumerate(headers):
+            item = QTableWidgetItem(header_text)
+            try:
+                dt = datetime.strptime(header_text, '%Y-%m-%d')
+                if dt.weekday() == 6:  # 週日
+                    item.setBackground(QColor("#AD1457"))
+                    item.setForeground(QColor("#FFFFFF"))
+                    font = QFont()
+                    font.setBold(True)
+                    item.setFont(font)
+            except ValueError:
+                pass
+            self.table.setHorizontalHeaderItem(col_idx, item)
+
+        self.table.horizontalHeader().setStyleSheet(
+            "QHeaderView::section { padding: 4px; border: 1px solid #ccc; }"
+        )
+
         y_labels = [f"{emp_id} {name_dict.get(emp_id, '')}" for emp_id in pivot_df.index] + ["📊 每日出勤總計"]
         self.table.setVerticalHeaderLabels(y_labels)
 
