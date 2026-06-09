@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, Q
 from PySide6.QtCore import Qt, QDate, QSettings
 from PySide6.QtGui import QColor, QFont
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from database.db_manager import DatabaseManager
 from database.data_importer import DataImporter
 from ui.db_dialog import DatabaseManagerDialog
@@ -323,38 +323,73 @@ class MainWindow(QMainWindow):
             emp_data = pivot_df.loc[emp_id]
             emp_name = name_dict.get(emp_id, '')
             
-            # 1. 取出核心 56 天的資料 (過濾掉邊界，只針對這 56 天算假)
-            core_dates = pd.date_range(start=base_start, end=base_end).strftime('%Y-%m-%d')
+            # 1. 取出核心 56 天的資料 (過濾掉邊界，只針對這 56 天算假總量)
+            core_dates = pd.date_range(start=base_start, end=base_end).strftime('%Y-%m-%d').tolist()
             valid_core_dates = [d for d in core_dates if d in emp_data.index]
             core_data = emp_data[valid_core_dates]
             
-            # 💡 [核心修正] 嚴格檢核 8R 與 8r，多一天少一天都不行，且不可用 L 或 P 混充！
+            # ==========================================
+            # 🛡️ 檢核 A：靜態週 (週日至週六) 只能有 1 個 R
+            # ==========================================
+            weeks_dict = {}
+            for d_str in emp_data.index:
+                try:
+                    d_obj = datetime.strptime(d_str, '%Y-%m-%d')
+                    # 計算距離本週日的差值，求出本靜態週的週日日期
+                    days_since_sun = (d_obj.weekday() + 1) % 7 
+                    sun_date = d_obj - timedelta(days=days_since_sun)
+                    sun_str = sun_date.strftime('%Y-%m-%d')
+                    
+                    if sun_str not in weeks_dict:
+                        weeks_dict[sun_str] = []
+                    weeks_dict[sun_str].append(d_str)
+                except ValueError:
+                    pass
+
+            violating_weeks = []
+            for sun_str, week_dates in weeks_dict.items():
+                # 只有當該週「完整落在雷達掃描範圍」且「與核心 56 天有交集」時才檢核
+                if len(week_dates) == 7 and any(d in valid_core_dates for d in week_dates):
+                    week_R_count = sum(emp_data[d] == 'R' for d in week_dates)
+                    if week_R_count != 1:
+                        violating_weeks.append(f"{sun_str}週 (R={week_R_count})")
+
+            # 總量檢核
             R_count = sum(core_data == 'R')
             r_count = sum(core_data == 'r')
+            off_pass = (R_count == 8) and (r_count == 8) and (len(violating_weeks) == 0)
             
-            off_pass = (R_count == 8) and (r_count == 8)
-            
-            # 2. 檢核連續上班天數 (掃描包含前後6天的完整 68 天)
+            # ==========================================
+            # 🛡️ 檢核 B：連續上班天數 (遇 R 或 r 才中斷)
+            # ==========================================
             max_consec = 0
             current_consec = 0
             for val in emp_data:
-                if val in WORK_SHIFTS:
+                val_str = str(val).strip()
+                # 💡 [修改] 只有真正的休息日/例假(R, r)或尚未排班(空白)才能中斷連續工作
+                if val_str in ['R', 'r', '']:
+                    current_consec = 0
+                else:
+                    # L(特休)、P(事假) 現在會被視為佔用連續天數 (不斷橋)
                     current_consec += 1
                     max_consec = max(max_consec, current_consec)
-                else:
-                    current_consec = 0
+                    
             consec_pass = max_consec <= 6
             
+            # === 產出結果報表 ===
             if off_pass and consec_pass:
-                html_report += f"<p style='color: green; font-size: 14px;'>✅ <b>{emp_id} {emp_name}</b>: 合格 (例假 8 天, 休息日 8 天，最長連班 {max_consec} 天)</p>"
+                html_report += f"<p style='color: green; font-size: 14px;'>✅ <b>{emp_id} {emp_name}</b>: 合格 (例假 8 天, 休息日 8 天，靜態週均剛好 1 例，最長連班 {max_consec} 天)</p>"
             else:
                 all_pass = False
                 err_msg = []
                 if R_count != 8 or r_count != 8: 
-                    err_msg.append(f"例假 <b>{R_count}</b> 天 / 休息日 <b>{r_count}</b> 天 (依法應各為 8 天)")
+                    err_msg.append(f"總量錯誤：例假 <b>{R_count}</b> 天 / 休息日 <b>{r_count}</b> 天 (依法應各為 8 天)")
+                if len(violating_weeks) > 0:
+                    err_msg.append(f"靜態週違規 (非剛好 1 個 R)：<b>{', '.join(violating_weeks)}</b>")
                 if not consec_pass: 
-                    err_msg.append(f"發現跨期連班達 <b>{max_consec}</b> 天")
-                html_report += f"<p style='color: red; font-size: 14px;'>❌ <b>{emp_id} {emp_name}</b>: 違規！ {', '.join(err_msg)}</p>"
+                    err_msg.append(f"違法連班達 <b>{max_consec}</b> 天 (未被 R 或 r 中斷)")
+                
+                html_report += f"<p style='color: red; font-size: 14px;'>❌ <b>{emp_id} {emp_name}</b>: 違規！<br>&nbsp;&nbsp;👉 { '<br>&nbsp;&nbsp;👉 '.join(err_msg) }</p>"
 
         # 💡 [視覺與功能升級] 呼叫專業的獨立彈出視窗來渲染完整報告
         dialog = QDialog(self)

@@ -89,3 +89,60 @@ class DataImporter:
             
         except Exception as e:
             return False, f"❌ 歷史班表匯入發生錯誤:\n{str(e)}"
+        
+    #預排班表匯入
+    def import_pre_schedule(self, excel_path, start_date):
+        """
+        讀取預排班表並存入資料庫 (使用與歷史班表相同的絕對位置邏輯)
+        :param excel_path: Excel 檔案路徑
+        :param start_date: 該班表第一天對應的真實日期 (格式 'YYYY-MM-DD')
+        """
+        try:
+            # header=None 將整張表當作純二維陣列讀取
+            df = pd.read_excel(excel_path, header=None)
+            df = df.replace("r'", "r", regex=False)
+            
+            records = []
+            # 計算班表天數：總欄數扣除前 3 欄 (索引 0, 1, 2)
+            num_days = len(df.columns) - 3
+            # 自動生成對應的日期序列
+            dates = pd.date_range(start=start_date, periods=num_days).strftime('%Y-%m-%d').tolist()
+
+            # 從第 3 列 (索引 2) 開始往下迭代每一位員工
+            for idx, row in df.iloc[2:].iterrows():
+                # 第 2 欄 (索引 1) 是員工編號
+                emp_id = str(row[1]).strip()
+                
+                # 若無員工編號則跳過
+                if emp_id == 'nan' or not emp_id:
+                    continue
+                    
+                # 第 4 欄 (索引 3) 開始是每日班別
+                for day_idx, date in enumerate(dates):
+                    shift_val = row[3 + day_idx]
+                    shift_code = str(shift_val).strip() if pd.notna(shift_val) else None
+                    
+                    # 💡 預排邏輯：無視空格與 nan，只寫入有值的格子
+                    if shift_code and shift_code.lower() != 'nan':
+                        records.append((emp_id, date, shift_code, 1))
+
+            if not records:
+                return False, "找不到可匯入的排班資料，請檢查 Excel 格式。"
+
+            # 寫入 SQLite (使用 UPSERT)
+            conn = self.db_manager.get_connection()
+            cursor = conn.cursor()
+            cursor.executemany('''
+                INSERT INTO schedule (emp_id, date, shift_code, is_locked)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(emp_id, date) DO UPDATE SET 
+                    shift_code = excluded.shift_code,
+                    is_locked = excluded.is_locked
+            ''', records)
+            conn.commit()
+            conn.close()
+            
+            return True, f"✅ 成功匯入並鎖定 {len(records)} 筆預排班別！"
+            
+        except Exception as e:
+            return False, f"匯入發生錯誤:\n{str(e)}"
