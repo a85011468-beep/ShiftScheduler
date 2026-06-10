@@ -216,6 +216,23 @@ class ScheduleEngine:
                     
                     virtual_penalties.append(slack_min * 1000000)
                     virtual_vars_dict[(date, shift)] = slack_min
+                
+                # 💡 [新增] 雙數無中A，單數1位中A 的動態硬限制
+                # 1. 計算該日「總上班人數」(is_working 已經排除了休假 L, P, r, R)
+                total_working_d = sum(is_working[(emp_id, date)] for emp_id in emp_ids)
+                
+                # 2. 取得該日被排入 '01中A' 的總人數
+                mid_a_count = sum(works[(emp_id, date, '01中A')] for emp_id in emp_ids if (emp_id, date, '01中A') in works)
+                
+                # 3. 數學魔法：總上班人數 = 2 * (任意整數) + 中A人數
+                # 這樣一來，如果總人數是 10 (雙數)，mid_a_count 只能被迫等於 0
+                # 如果總人數是 11 (單數)，mid_a_count 只能被迫等於 1
+                max_q = len(emp_ids) // 2 + 1
+                q_var = model.NewIntVar(0, max_q, f'q_working_{date}')
+                model.Add(total_working_d == 2 * q_var + mid_a_count)
+                
+                # ⚠️ 防呆機制：確保中A人數絕對不超過 1
+                model.Add(mid_a_count <= 1)
 
                 early_combo_vars = [works[(emp_id, date, '01早B2')] for emp_id in emp_ids] + \
                                    [works[(emp_id, date, '01早m')] for emp_id in emp_ids]
@@ -243,7 +260,7 @@ class ScheduleEngine:
                 if s_pref == 'NIGHT_ONLY':
                     allowed_ot_shifts = ['01夜B1', '01夜B2']
                 else:
-                    allowed_ot_shifts = ['01早B1', '01午B1', '01中A', '01早m', '01午m']
+                    allowed_ot_shifts = ['01早B1', '01午B1', '01早B2', '01午B2', '01中A', '01早m', '01午m']
                 
                 for d in eval_dates:
                     is_ot = model.NewBoolVar(f'is_ot_{eid}_{d}')
@@ -406,12 +423,30 @@ class ScheduleEngine:
             # =========================================================================
             WEIGHT_SHIFT_PREF = 10       
             WEIGHT_LOCATION_MIX = 5      # 💡 中等權重：避免連兩天同地點
-            WEIGHT_BLOCK_PREF = 1        
+            WEIGHT_BLOCK_PREF = 1
+            WEIGHT_BALANCE_EARLY_NOON = 3 # 💡 [新增] 早午班平均權重 (設定為 3，讓它具有一定影響力但不至於蓋過員工意願)        
 
             shift_pref_score = []
             block_penalty_score = []
             location_penalty_score = []  # 💡 儲存地點扣分變數
             m_level_penalty_score = []   # 💡 職級 M 軟限制扣分
+            balance_penalty_score = []   # 💡 [新增] 存放每天早午班人數差異的扣分陣列
+
+            early_shifts_list = ['01早B1', '01早B2', '01早m'] 
+            noon_shifts_list = ['01午B1', '01午B2', '01午m']
+            
+            for d in eval_dates:
+                early_count = sum(works[(emp_id, d, s)] for emp_id in emp_ids for s in early_shifts_list if (emp_id, d, s) in works)
+                noon_count = sum(works[(emp_id, d, s)] for emp_id in emp_ids for s in noon_shifts_list if (emp_id, d, s) in works)
+                
+                # 宣告一個變數代表差距
+                diff_var = model.NewIntVar(0, len(emp_ids), f'diff_e_n_{d}')
+                
+                # 數學實作絕對值：diff_var >= early - noon 且 diff_var >= noon - early
+                model.Add(diff_var >= early_count - noon_count)
+                model.Add(diff_var >= noon_count - early_count)
+                
+                balance_penalty_score.append(diff_var)
 
             for emp_id in emp_ids:
                 s_pref = shift_prefs.get(str(emp_id).strip(), 'MIX')
@@ -536,6 +571,7 @@ class ScheduleEngine:
                 - WEIGHT_BLOCK_PREF * sum(block_penalty_score)
                 - WEIGHT_LOCATION_MIX * sum(location_penalty_score)
                 - sum(m_level_penalty_score)
+                - WEIGHT_BALANCE_EARLY_NOON * sum(balance_penalty_score) # 💡 新增這行：扣除早午班人數差距
                 - sum(virtual_penalties)
             )
 
