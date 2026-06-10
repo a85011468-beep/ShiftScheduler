@@ -10,8 +10,10 @@ from PySide6.QtGui import QColor, QFont
 from datetime import datetime
 import pandas as pd
 from engine.solver import ScheduleEngine
-from config.settings import OFF_SHIFTS, ALL_STATES
+from config.settings import OFF_SHIFTS, ALL_STATES, SHIFT_DEMANDS
 from database.data_importer import DataImporter
+
+
 class CustomSpinBox(QSpinBox):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -233,8 +235,21 @@ class SchedulerDialog(QDialog):
         total_days_p2 = len(p2_dates)
 
         all_headers = headers_left + date_columns + headers_right
-        self.table.setRowCount(len(pivot_df) + 2)
+        # 💡 [新增] 定義底部的統計列與對應的班別代碼
+        self.stats_rows = [
+            ("早M", ["01早M"]), ("早m", ["01早m"]), 
+            ("早B1", ["01早B1"]), ("早B2", ["01早B2"]),
+            ("中A", ["01中A"]), 
+            ("午M", ["01午M"]), ("午m", ["01午m"]), 
+            ("午B1", ["01午B1"]), ("午B2", ["01午B2"]), 
+            ("夜(B1+B2)", ["01夜B1", "01夜B2"])
+        ]
+
+        all_headers = headers_left + date_columns + headers_right
+        # 💡 改為：1 (批次列) + 員工總數 + 詳細統計的列數
+        self.table.setRowCount(len(pivot_df) + 1 + len(self.stats_rows))
         self.table.setColumnCount(len(all_headers))
+
 
         for col_idx, header_text in enumerate(all_headers):
             item = QTableWidgetItem(header_text)
@@ -252,7 +267,8 @@ class SchedulerDialog(QDialog):
             
         self.table.horizontalHeader().setStyleSheet("QHeaderView::section { padding: 4px; border: 1px solid #ccc; }")
         
-        y_labels = ["⚡ 批次套用"] + [f"{emp_id} {name_dict.get(emp_id, '')}" for emp_id in pivot_df.index] + ["📊 每日出勤總計"]
+        # 💡 Y 軸標籤也展開
+        y_labels = ["⚡ 批次套用"] + [f"{emp_id} {name_dict.get(emp_id, '')}" for emp_id in pivot_df.index] + [f"📊 {label}" for label, _ in self.stats_rows]
         self.table.setVerticalHeaderLabels(y_labels)
 
         # 批次套用工具列
@@ -398,45 +414,65 @@ class SchedulerDialog(QDialog):
             updater() 
 
         # ==========================================
-        # 👑 最底下列：每日出勤統計
+        # 👑 最底下列：多列班別詳細統計與紅綠燈
         # ==========================================
-        last_row_idx = len(pivot_df) + 1
+        last_row_start = len(pivot_df) + 1
         
-        # 補滿底下的左側灰色方塊
-        for i in range(len(headers_left)):
-            item = QTableWidgetItem("")
-            item.setBackground(QColor("#E0E0E0"))
-            item.setFlags(item.flags() & ~Qt.ItemIsEditable) 
-            self.table.setItem(last_row_idx, i, item)
-
-        # 日期出勤加總
-        for col_idx, date in enumerate(date_columns):
-            col_data = pivot_df[date]
-            work_count = sum((col_data != '') & (~col_data.isin(OFF_SHIFTS)))
-            item = QTableWidgetItem(f"{work_count} 人")
-            item.setTextAlignment(Qt.AlignCenter)
-            item.setFlags(item.flags() & ~Qt.ItemIsEditable) 
-            item.setBackground(self._get_gradient_color(work_count))
-            item.setForeground(QColor("#000000"))
-            font = QFont()
-            font.setBold(True)
-            font.setPointSize(14)
-            self.table.setItem(last_row_idx, col_idx + len(headers_left), item)
-
-        # 補滿底下的右側灰色方塊
-        if self.split_date:
-            r_start = len(headers_left) + len(date_columns)
-            for i in range(len(headers_right)):
+        for row_offset, (label, shift_codes) in enumerate(self.stats_rows):
+            current_row = last_row_start + row_offset
+            
+            # 補滿底下的左側灰色方塊
+            for i in range(len(headers_left)):
                 item = QTableWidgetItem("")
                 item.setBackground(QColor("#E0E0E0"))
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable) 
-                self.table.setItem(last_row_idx, r_start + i, item)
+                self.table.setItem(current_row, i, item)
+
+            # 該班別每日人數計算與上色
+            for col_idx, date in enumerate(date_columns):
+                col_data = pivot_df[date]
+                count = sum(col_data.isin(shift_codes))
+                
+                # 計算這些班別在 SHIFT_DEMANDS 裡的「最大需求人數上限」 (防呆：若沒設定預設為 1)
+                max_limit = sum(SHIFT_DEMANDS.get(sc, (0, 1))[1] for sc in shift_codes)
+                if max_limit == 0: max_limit = 1 
+                
+                item = QTableWidgetItem(f"{count}")
+                item.setTextAlignment(Qt.AlignCenter)
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable) 
+                
+                # 🚦 紅綠燈判定機制
+                if count == 0:
+                    item.setBackground(QColor("#FFCDD2")) # 淺紅背景
+                    item.setForeground(QColor("#B71C1C")) # 深紅字
+                elif count >= max_limit:
+                    item.setBackground(QColor("#C8E6C9")) # 淺綠背景
+                    item.setForeground(QColor("#1B5E20")) # 深綠字
+                else:
+                    item.setBackground(QColor("#FFF9C4")) # 淺黃背景 (提醒未滿)
+                    item.setForeground(QColor("#F57F17")) # 深橘字
+                    
+                font = QFont()
+                font.setBold(True)
+                font.setPointSize(11) # 字體縮小一點，避免畫面太擁擠
+                item.setFont(font)
+                
+                self.table.setItem(current_row, col_idx + len(headers_left), item)
+
+            # 補滿底下的右側灰色方塊 (跨出區塊)
+            if self.split_date:
+                r_start = len(headers_left) + len(date_columns)
+                for i in range(len(headers_right)):
+                    item = QTableWidgetItem("")
+                    item.setBackground(QColor("#E0E0E0"))
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable) 
+                    self.table.setItem(current_row, r_start + i, item)
 
         # 欄位寬度固定設定
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.table.horizontalHeader().setDefaultSectionSize(75)
-        self.table.verticalHeader().setDefaultSectionSize(40)
+        self.table.verticalHeader().setDefaultSectionSize(35)
         
         # 縮小特定設定區塊的寬度
         for i in range(len(headers_left)):

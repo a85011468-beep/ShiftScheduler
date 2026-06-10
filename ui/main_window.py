@@ -10,7 +10,7 @@ from database.db_manager import DatabaseManager
 from database.data_importer import DataImporter
 from ui.db_dialog import DatabaseManagerDialog
 from ui.scheduler_dialog import SchedulerDialog
-from config.settings import ALL_STATES, OFF_SHIFTS
+from config.settings import ALL_STATES, OFF_SHIFTS, SHIFT_DEMANDS
 
 class MainWindow(QMainWindow):
     def __init__(self):
