@@ -433,6 +433,7 @@ class ScheduleEngine:
             m_level_penalty_score = []   # 💡 職級 M 軟限制扣分
             balance_penalty_score = []   # 💡 [新增] 存放每天早午班人數差異的扣分陣列
 
+            night_shifts_list = ['01夜B1', '01夜B2']
             early_shifts_list = ['01早B1', '01早B2', '01早m'] 
             noon_shifts_list = ['01午B1', '01午B2', '01午m']
             
@@ -454,6 +455,69 @@ class ScheduleEngine:
                 b_pref = block_prefs.get(str(emp_id).strip(), 'ANY')
                 is_m_level = job_levels.get(str(emp_id).strip(), 'Normal') == 'M'
                 
+                # =========================================================================
+            # 🎯 全域權重規則：非 b_pref == '6' 者，連六天上班扣 5 分
+            # =========================================================================
+            global_consec_6_penalties = []
+            for emp_id in emp_ids:
+                eid = str(emp_id).strip()
+                b_pref = block_prefs.get(eid, 'ANY')
+                if b_pref == '6':
+                    continue  # 跳過做六休一偏好的人
+                
+                # 掃描滾動 6 天區間
+                for i in range(len(all_eval_dates) - 5):
+                    window_w = []
+                    for j in range(6):
+                        d = all_eval_dates[i+j]
+                        if d < eval_dates[0]:
+                            shift = dict_history.get((emp_id, d))
+                            val = 1 if (shift in WORK_SHIFTS) else 0
+                            window_w.append(val)
+                        else:
+                            window_w.append(is_working[(emp_id, d)])
+                    
+                    is_c6 = model.NewBoolVar(f'global_c6_{eid}_{i}')
+                    model.Add(sum(window_w) == 6).OnlyEnforceIf(is_c6)
+                    model.Add(sum(window_w) < 6).OnlyEnforceIf(is_c6.Not())
+                    global_consec_6_penalties.append(5 * is_c6)
+
+            # =========================================================================
+            # 🛡️ 夜班天數平分硬限制 (M 與 Chief 平分扣除 Night_only 後的夜班)
+            # =========================================================================
+            m_chief_ids = [emp_id for emp_id in emp_ids if job_levels.get(str(emp_id).strip(), 'Normal') in ['M', 'Chief']]
+            
+            if m_chief_ids:
+                num_m_chief = len(m_chief_ids)
+                
+                # 計算每位 M/Chief 員工在本次未來排班期間內的夜班總數
+                emp_night_counts = {}
+                for emp_id in m_chief_ids:
+                    emp_night_counts[emp_id] = sum(
+                        works[(emp_id, d, s)] 
+                        for d in eval_dates 
+                        for s in night_shifts_list 
+                        if (emp_id, d, s) in works
+                    )
+                
+                # 所有 M 與 Chief 的夜班總量
+                total_m_chief_night = sum(emp_night_counts[emp_id] for emp_id in m_chief_ids)
+                
+                # 定義平分底數變數 (目標平均值的地板值)
+                target_night_base = model.NewIntVar(0, len(eval_dates) * 2, 'target_night_base')
+                
+                # 核心數學公式：
+                # 確保 target_night_base <= 實際平均值 < target_night_base + 1
+                model.Add(total_m_chief_night >= target_night_base * num_m_chief)
+                model.Add(total_m_chief_night < (target_night_base + 1) * num_m_chief)
+                
+                # 強制每位 M/Chief 的個人夜班天數只能是 base 或 base + 1
+                # 完美達成「除不盡時，差距最多 1 天」的絕對平分
+                for emp_id in m_chief_ids:
+                    model.Add(emp_night_counts[emp_id] >= target_night_base)
+                    model.Add(emp_night_counts[emp_id] <= target_night_base + 1)
+                
+                
                 # 🤡 [新增] 職級 M 的專屬軟限制
                 if is_m_level:
                     for d in target_dates:
@@ -461,6 +525,7 @@ class ScheduleEngine:
                         m_level_penalty_score.append(10 * works[(emp_id, d, '01午B1')])
                         m_level_penalty_score.append(20 * works[(emp_id, d, '01早B2')])
                         m_level_penalty_score.append(20 * works[(emp_id, d, '01午B2')])
+                        m_level_penalty_score.append(10 * works[(emp_id, d, '01中A')])
 
                 # A. 班別意願加分
                 if s_pref == 'EARLY':
@@ -573,6 +638,7 @@ class ScheduleEngine:
                 - WEIGHT_LOCATION_MIX * sum(location_penalty_score)
                 - sum(m_level_penalty_score)
                 - WEIGHT_BALANCE_EARLY_NOON * sum(balance_penalty_score) # 💡 新增這行：扣除早午班人數差距
+                - sum(global_consec_6_penalties) # 💡 新增這行：扣除全域連六上班的分數
                 - sum(virtual_penalties)
             )
 
