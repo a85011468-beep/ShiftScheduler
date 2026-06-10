@@ -216,23 +216,6 @@ class ScheduleEngine:
                     
                     virtual_penalties.append(slack_min * 1000000)
                     virtual_vars_dict[(date, shift)] = slack_min
-                
-                # 💡 [新增] 雙數無中A，單數1位中A 的動態硬限制
-                # 1. 計算該日「總上班人數」(is_working 已經排除了休假 L, P, r, R)
-                total_working_d = sum(is_working[(emp_id, date)] for emp_id in emp_ids)
-                
-                # 2. 取得該日被排入 '01中A' 的總人數
-                mid_a_count = sum(works[(emp_id, date, '01中A')] for emp_id in emp_ids if (emp_id, date, '01中A') in works)
-                
-                # 3. 數學魔法：總上班人數 = 2 * (任意整數) + 中A人數
-                # 這樣一來，如果總人數是 10 (雙數)，mid_a_count 只能被迫等於 0
-                # 如果總人數是 11 (單數)，mid_a_count 只能被迫等於 1
-                max_q = len(emp_ids) // 2 + 1
-                q_var = model.NewIntVar(0, max_q, f'q_working_{date}')
-                model.Add(total_working_d == 2 * q_var + mid_a_count)
-                
-                # ⚠️ 防呆機制：確保中A人數絕對不超過 1
-                model.Add(mid_a_count <= 1)
 
                 early_combo_vars = [works[(emp_id, date, '01早B2')] for emp_id in emp_ids] + \
                                    [works[(emp_id, date, '01早m')] for emp_id in emp_ids]
@@ -347,6 +330,24 @@ class ScheduleEngine:
                         model.Add(is_night[(emp_id, d)] == sum(works[(emp_id, d, s)] for s in NIGHT_SHIFTS))
                         model.Add(is_g1[(emp_id, d)] == sum(works[(emp_id, d, s)] for s in LOCATION_G1))
                         model.Add(is_g2[(emp_id, d)] == sum(works[(emp_id, d, s)] for s in LOCATION_G2))
+            # 👇 請在這裡新增這個獨立區塊 👇
+            # =========================================================================
+            # 4.5 動態硬限制：單雙數決定中A班 (依賴 is_working)
+            # =========================================================================
+            for date in eval_dates:
+                # 1. 取得該日「總上班人數」(使用剛剛步驟4定義好的 is_working)
+                total_working_d = sum(is_working[(emp_id, date)] for emp_id in emp_ids)
+                
+                # 2. 取得該日被排入 '01中A' 的總人數
+                mid_a_count = sum(works[(emp_id, date, '01中A')] for emp_id in emp_ids if (emp_id, date, '01中A') in works)
+                
+                # 3. 單雙數商數與餘數判定
+                max_q = len(emp_ids) // 2 + 1
+                q_var = model.NewIntVar(0, max_q, f'q_working_{date}')
+                model.Add(total_working_d == 2 * q_var + mid_a_count)
+                
+                # 4. 防呆機制：確保中A人數絕對不超過 1
+                model.Add(mid_a_count <= 1)
 
             # =========================================================================
             # 🛡️ 連班與例假防線 (取代原有的單純 is_working 判斷)
