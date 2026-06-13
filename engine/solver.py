@@ -123,7 +123,7 @@ class ScheduleEngine:
         return list(set(diagnostics))
 
 
-    def run_scheduler(self, start_date, end_date, leave_quotas=None, split_date=None):
+    def run_scheduler(self, start_date, end_date, leave_quotas=None, split_date=None, debug_mode=False):
         if leave_quotas is None: leave_quotas = {}
         
         employees = self.db.get_all_active_employees()
@@ -134,7 +134,9 @@ class ScheduleEngine:
         job_levels = {str(e['emp_id']).strip(): str(e['job_level']).strip() for e in employees}
         shift_prefs = {str(e['emp_id']).strip(): str(e.get('shift_pref', 'MIX')).strip() for e in employees}
         block_prefs = {str(e['emp_id']).strip(): str(e.get('block_pref', 'ANY')).strip() for e in employees}
-
+        # 💡 [新增] 讀取夜班分段意願 (設定值可為 '1', '2', '3', 或 'ANY')
+        night_seg_prefs = {str(e['emp_id']).strip(): str(e.get('night_seg_pref', 'ANY')).strip() for e in employees}
+    
         target_dates = pd.date_range(start=start_date, end=end_date).strftime('%Y-%m-%d').tolist()
         eval_dates = target_dates 
         
@@ -217,14 +219,18 @@ class ScheduleEngine:
                     virtual_penalties.append(slack_min * 1000000)
                     virtual_vars_dict[(date, shift)] = slack_min
 
+                # 💡 [修改] 加入 01早B2c 戰力
                 early_combo_vars = [works[(emp_id, date, '01早B2')] for emp_id in emp_ids] + \
+                                   [works[(emp_id, date, '01早B2c')] for emp_id in emp_ids] + \
                                    [works[(emp_id, date, '01早m')] for emp_id in emp_ids]
                 slack_early = model.NewIntVar(0, 2, f'slack_early_{date}')
                 model.Add(sum(early_combo_vars) + slack_early >= 2)
                 virtual_penalties.append(slack_early * 1000000)
                 virtual_vars_dict[(date, '早班複合戰力')] = slack_early
 
+                # 💡 [修改] 加入 01午B2c 戰力
                 noon_combo_vars = [works[(emp_id, date, '01午B2')] for emp_id in emp_ids] + \
+                                  [works[(emp_id, date, '01午B2c')] for emp_id in emp_ids] + \
                                   [works[(emp_id, date, '01午m')] for emp_id in emp_ids]
                 slack_noon = model.NewIntVar(0, 2, f'slack_noon_{date}')
                 model.Add(sum(noon_combo_vars) + slack_noon >= 2)
@@ -394,6 +400,26 @@ class ScheduleEngine:
                             else:
                                 window_R.append(works[(emp_id, d, 'R')])
                         model.Add(sum(window_R) == 1)
+                # 👇 💡 [新增] 條件 3：拒絕引擎連續四天休假 (預排圖釘四天以上除外)
+                for i in range(len(all_eval_dates) - 3):
+                    window_dates = [all_eval_dates[i+j] for j in range(4)]
+                    
+                    # 計算這 4 天內，有幾天是「歷史紀錄的休假」或「未來被人工鎖定的休假」
+                    locked_off_count = 0
+                    for d in window_dates:
+                        if d < eval_dates[0]: # 過去的歷史紀錄
+                            shift = dict_history.get((emp_id, d))
+                            if shift in OFF_SHIFTS:
+                                locked_off_count += 1
+                        else:                 # 未來需排班的日子
+                            record = dict_sched.get((emp_id, d))
+                            if record and record['is_locked'] == 1 and record['shift_code'] in OFF_SHIFTS:
+                                locked_off_count += 1
+                    
+                    # 💡 判斷：若這 4 天「沒有全部被人工鎖死為休假」
+                    # 代表引擎有權限排定其中至少 1 天，我們就強制限制這 4 天的休假總和不得超過 3 天
+                    if locked_off_count < 4:
+                        model.Add(sum(is_off[(emp_id, d)] for d in window_dates) <= 3)
 
             # 5. 交接班時序防線
             if strict_time_rules:
@@ -422,12 +448,17 @@ class ScheduleEngine:
             # =========================================================================
             # 🎯 權重優化核心 (軟限制打分)
             # =========================================================================
-            WEIGHT_SHIFT_PREF = 5       
-            WEIGHT_LOCATION_MIX = 5      # 💡 中等權重：避免連兩天同地點
-            WEIGHT_BLOCK_PREF = 1
-            WEIGHT_BALANCE_EARLY_NOON = 7 # 💡 [新增] 早午班平均權重 (設定為 3，讓它具有一定影響力但不至於蓋過員工意願) 
-            WEIGHT_NIGHT_BALANCE = 20      # 💡 [新增] 夜班平分權重 (差距 1 天就扣 5 分)       
+            WEIGHT_SHIFT_PREF = 10       
+            WEIGHT_LOCATION_MIX = 30      # 💡 中等權重：避免連兩天同地點
+            WEIGHT_BLOCK_PREF = 5
+            WEIGHT_BALANCE_EARLY_NOON = 50 # 💡 [新增] 早午班平均權重 (設定為 3，讓它具有一定影響力但不至於蓋過員工意願) 
+            WEIGHT_NIGHT_BALANCE = 50      # 💡 [新增] 夜班平分權重 (差距 1 天就扣 5 分)       
             WEIGHT_M_SHIFT_BONUS = 1      # 💡 [新增] m 班別優先權重 (+1分)
+            WEIGHT_NIGHT_SEGMENT = 10     # 💡 [新增] 夜班分段偏好的扣分權重
+            WEIGHT_M_DAY_BALANCE = 5      # 💡 [新增] 日間主管班 (M/m) 平分的扣分權重
+            WEIGHT_C_SHIFT_BALANCE = 5    # 💡 [新增] Normal 員工 C 班平分的扣分權重
+            WEIGHT_A_SHIFT_BALANCE = 5    # 💡 [新增] 中A班平分的扣分權重
+            WEIGHT_A_SHIFT_MAX_1 = 50     # 💡 [新增] 中A班超過1天的極重度防線權重
 
             shift_pref_score = []
             block_penalty_score = []
@@ -438,9 +469,15 @@ class ScheduleEngine:
             night_balance_penalty = []
             m_shift_bonus_score = []     # 💡 [新增] 存放排入 m 班的加分陣列
             t_fallback_penalty_score = [] # 💡 [新增] 存放 t 職級退讓的扣分陣列
+            night_segment_penalty_score = [] # 💡 [新增] 存放夜班段數違規的扣分陣列
+            m_day_balance_penalty = []    # 💡 [新增] 存放 M/m 班平分違規的扣分陣列
+            c_shift_balance_penalty = []  # 💡 [新增] 存放 C 班平分違規的扣分陣列
+            a_shift_balance_penalty = []  # 💡 [新增] 存放中A班平分違規的扣分陣列
+            a_shift_max_penalty = []      # 💡 [新增] 存放中A班超過1天的扣分陣列
 
-            early_shifts_list = ['01早B1', '01早B2', '01早m'] 
-            noon_shifts_list = ['01午B1', '01午B2', '01午m']
+            # 💡 [修改] 補上 c 班別，讓引擎精準計算早班與午班的總人力
+            early_shifts_list = ['01早B1', '01早B1c', '01早B2', '01早B2c', '01早m'] 
+            noon_shifts_list = ['01午B1', '01午B1c', '01午B2', '01午B2c', '01午m']
             
             for d in eval_dates:
                 early_count = sum(works[(emp_id, d, s)] for emp_id in emp_ids for s in early_shifts_list if (emp_id, d, s) in works)
@@ -477,7 +514,173 @@ class ScheduleEngine:
                     is_c6 = model.NewBoolVar(f'global_c6_{eid}_{i}')
                     model.Add(sum(window_w) == 6).OnlyEnforceIf(is_c6)
                     model.Add(sum(window_w) < 6).OnlyEnforceIf(is_c6.Not())
-                    global_consec_6_penalties.append(5 * is_c6)
+                    global_consec_6_penalties.append(10 * is_c6)
+            # =========================================================================
+            # ⚖️ 日間主管班 (早M 與 午M) 天數平分軟限制 + 負債制
+            # =========================================================================
+            # 💡 預留外部傳入的「本期提撥償還字典」(若尚未從 UI 傳入則預設為空 {})
+            # 格式範例: applied_m_debts = {"A": 3, "B": -1}
+            applied_m_debts = getattr(self, 'applied_m_debts', {}) 
+
+            # 1. 篩選名單：職級為 M/Chief 且 意願不是純夜班
+            m_chief_ids_day = [
+                emp_id for emp_id in emp_ids 
+                if job_levels.get(str(emp_id).strip(), 'Normal') in ['M', 'Chief'] 
+                and shift_prefs.get(str(emp_id).strip(), 'MIX') != 'NIGHT_ONLY'
+            ]
+
+            if len(m_chief_ids_day) > 1:
+                # 💡 [修改] 僅保留 '01早M' 與 '01午M'，將 m 班排除在平分與負債機制之外
+                day_m_shifts_list = ['01早M', '01午M']
+                emp_day_m_counts_vars = []
+
+                for emp_id in m_chief_ids_day:
+                    eid_str = str(emp_id).strip()
+                    
+                    # 2. 計算該主管本月【實際】被排入的 早M 與 午M 班總數
+                    actual_m_count_expr = sum(
+                        works[(emp_id, d, s)] 
+                        for d in eval_dates 
+                        for s in day_m_shifts_list 
+                        if (emp_id, d, s) in works
+                    )
+                    
+                    # 3. 讀取人工設定的「本期提撥數」 (欠債為正，公司補償為負)
+                    applied_val = applied_m_debts.get(eid_str, 0)
+                    
+                    # 4. 宣告「虛擬承載量」 = 實際排班數 - 提撥數
+                    # (範圍放寬以容納極端負債，例如 -30 到 100)
+                    eff_m_count_var = model.NewIntVar(-len(eval_dates), len(eval_dates) * 2, f'eff_m_day_{emp_id}')
+                    model.Add(eff_m_count_var == actual_m_count_expr - applied_val)
+                    emp_day_m_counts_vars.append(eff_m_count_var)
+
+                # 5. 引擎計算總虛擬承載量，並除以人數求「平均基準 (Fair Share)」
+                total_eff_m = model.NewIntVar(-len(eval_dates)*len(m_chief_ids_day), len(eval_dates)*len(m_chief_ids_day)*2, 'total_eff_m_day')
+                model.Add(total_eff_m == sum(emp_day_m_counts_vars))
+                
+                avg_eff_m = model.NewIntVar(-len(eval_dates), len(eval_dates)*2, 'avg_eff_m_day')
+                model.AddDivisionEquality(avg_eff_m, total_eff_m, len(m_chief_ids_day))
+
+                # 6. 計算每個人與平均數的「絕對差值」，並丟進扣分陣列
+                for emp_id, eff_var in zip(m_chief_ids_day, emp_day_m_counts_vars):
+                    diff_m_var = model.NewIntVar(-len(eval_dates)*2, len(eval_dates)*2, f'diff_m_day_{emp_id}')
+                    model.Add(diff_m_var == eff_var - avg_eff_m)
+                    
+                    abs_diff_m_var = model.NewIntVar(0, len(eval_dates)*2, f'abs_diff_m_day_{emp_id}')
+                    model.AddAbsEquality(abs_diff_m_var, diff_m_var)
+                    
+                    m_day_balance_penalty.append(abs_diff_m_var)
+            # =========================================================================
+            # ⚖️ Normal 員工 C 班天數平分軟限制 + 負債制
+            # =========================================================================
+            # 💡 預留外部傳入的「本期 C 班提撥償還字典」(若尚未從 UI 傳入則預設為空 {})
+            applied_c_debts = getattr(self, 'applied_c_debts', {}) 
+
+            # 1. 篩選名單：職級為 Normal 且 意願不是純夜班
+            normal_ids_c_shift = [
+                emp_id for emp_id in emp_ids 
+                if job_levels.get(str(emp_id).strip(), 'Normal') == 'Normal' 
+                and shift_prefs.get(str(emp_id).strip(), 'MIX') != 'NIGHT_ONLY'
+            ]
+
+            if len(normal_ids_c_shift) > 1:
+                # 💡 指定所有 c 班別作為平分目標
+                c_shifts_list = ['01早B1c', '01早B2c', '01午B1c', '01午B2c']
+                emp_c_counts_vars = []
+
+                for emp_id in normal_ids_c_shift:
+                    eid_str = str(emp_id).strip()
+                    
+                    # 2. 計算該員工本月【實際】被排入的 C 班總數
+                    actual_c_count_expr = sum(
+                        works[(emp_id, d, s)] 
+                        for d in eval_dates 
+                        for s in c_shifts_list 
+                        if (emp_id, d, s) in works
+                    )
+                    
+                    # 3. 讀取人工設定的 C 班「本期提撥數」 (欠債為正，公司補償為負)
+                    applied_val_c = applied_c_debts.get(eid_str, 0)
+                    
+                    # 4. 宣告「虛擬承載量」 = 實際排班數 - 提撥數
+                    eff_c_count_var = model.NewIntVar(-len(eval_dates), len(eval_dates) * 2, f'eff_c_{emp_id}')
+                    model.Add(eff_c_count_var == actual_c_count_expr - applied_val_c)
+                    emp_c_counts_vars.append(eff_c_count_var)
+
+                # 5. 引擎計算總虛擬承載量，並除以人數求「平均基準 (Fair Share)」
+                total_eff_c = model.NewIntVar(-len(eval_dates)*len(normal_ids_c_shift), len(eval_dates)*len(normal_ids_c_shift)*2, 'total_eff_c')
+                model.Add(total_eff_c == sum(emp_c_counts_vars))
+                
+                avg_eff_c = model.NewIntVar(-len(eval_dates), len(eval_dates)*2, 'avg_eff_c')
+                model.AddDivisionEquality(avg_eff_c, total_eff_c, len(normal_ids_c_shift))
+
+                # 6. 計算每個人與平均數的「絕對差值」，並丟進扣分陣列
+                for emp_id, eff_var in zip(normal_ids_c_shift, emp_c_counts_vars):
+                    diff_c_var = model.NewIntVar(-len(eval_dates)*2, len(eval_dates)*2, f'diff_c_{emp_id}')
+                    model.Add(diff_c_var == eff_var - avg_eff_c)
+                    
+                    abs_diff_c_var = model.NewIntVar(0, len(eval_dates)*2, f'abs_diff_c_{emp_id}')
+                    model.AddAbsEquality(abs_diff_c_var, diff_c_var)
+                    
+                    c_shift_balance_penalty.append(abs_diff_c_var)
+            
+            # =========================================================================
+            # ⚖️ Normal 員工 中A 班：(1) 天數平分 + 負債制 (2) 至多一天限制
+            # =========================================================================
+            # 💡 預留外部傳入的「本期 中A 班提撥償還字典」(若尚未從 UI 傳入則預設為空 {})
+            applied_a_debts = getattr(self, 'applied_a_debts', {}) 
+
+            # 篩選名單：職級為 Normal 且 意願不是純夜班
+            normal_ids_a_shift = [
+                emp_id for emp_id in emp_ids 
+                if job_levels.get(str(emp_id).strip(), 'Normal') == 'Normal' 
+                and shift_prefs.get(str(emp_id).strip(), 'MIX') != 'NIGHT_ONLY'
+            ]
+
+            if len(normal_ids_a_shift) > 0:
+                a_shifts_list = ['01中A']
+                emp_a_counts_vars = []
+
+                for emp_id in normal_ids_a_shift:
+                    eid_str = str(emp_id).strip()
+                    
+                    # 1. 計算該員工本月【實際】被排入的 中A 班總數
+                    actual_a_count_expr = sum(
+                        works[(emp_id, d, s)] 
+                        for d in eval_dates 
+                        for s in a_shifts_list 
+                        if (emp_id, d, s) in works
+                    )
+                    
+                    # 📜 規則二：每月至多一天限制 (超過1天即產生物理扣分)
+                    over_1_var = model.NewIntVar(0, len(eval_dates), f'over_1_a_{emp_id}')
+                    model.AddMaxEquality(over_1_var, [0, actual_a_count_expr - 1])
+                    a_shift_max_penalty.append(over_1_var)
+                    
+                    # 📜 規則一：平分與負債制
+                    applied_val_a = applied_a_debts.get(eid_str, 0)
+                    
+                    # 宣告「虛擬承載量」 = 實際排班數 - 提撥數
+                    eff_a_count_var = model.NewIntVar(-len(eval_dates), len(eval_dates) * 2, f'eff_a_{emp_id}')
+                    model.Add(eff_a_count_var == actual_a_count_expr - applied_val_a)
+                    emp_a_counts_vars.append(eff_a_count_var)
+
+                # 必須有 2 人以上才具備互相「平分」的意義
+                if len(normal_ids_a_shift) > 1:
+                    total_eff_a = model.NewIntVar(-len(eval_dates)*len(normal_ids_a_shift), len(eval_dates)*len(normal_ids_a_shift)*2, 'total_eff_a')
+                    model.Add(total_eff_a == sum(emp_a_counts_vars))
+                    
+                    avg_eff_a = model.NewIntVar(-len(eval_dates), len(eval_dates)*2, 'avg_eff_a')
+                    model.AddDivisionEquality(avg_eff_a, total_eff_a, len(normal_ids_a_shift))
+
+                    for emp_id, eff_var in zip(normal_ids_a_shift, emp_a_counts_vars):
+                        diff_a_var = model.NewIntVar(-len(eval_dates)*2, len(eval_dates)*2, f'diff_a_{emp_id}')
+                        model.Add(diff_a_var == eff_var - avg_eff_a)
+                        
+                        abs_diff_a_var = model.NewIntVar(0, len(eval_dates)*2, f'abs_diff_a_{emp_id}')
+                        model.AddAbsEquality(abs_diff_a_var, diff_a_var)
+                        
+                        a_shift_balance_penalty.append(abs_diff_a_var)
             # =========================================================================
             # ⚖️ 夜班天數平分軟限制 (M 與 Chief 夜班差距越小越好，避免硬限制死結)
             # =========================================================================
@@ -529,21 +732,87 @@ class ScheduleEngine:
             for emp_id in emp_ids:
                 s_pref = shift_prefs.get(str(emp_id).strip(), 'MIX')
                 b_pref = block_prefs.get(str(emp_id).strip(), 'ANY')
+                n_seg_pref = night_seg_prefs.get(str(emp_id).strip(), 'ANY') # 💡 取得夜班段數意願
                 is_m_level = job_levels.get(str(emp_id).strip(), 'Normal') in ('M', 't')
                 is_t_level = job_levels.get(str(emp_id).strip(), 'Normal') == 't'
                 # 🤡 [新增] 職級 M 的專屬軟限制
+
+                # 🌙 [新增] 夜班連續段數偏好打分
+                if n_seg_pref in ['1', '2', '3'] and s_pref != 'NIGHT_ONLY':
+                    segment_vars = []
+                    # 1. 掃描整個歷史與未來區間，計算「夜班段數」
+                    for i in range(1, len(all_eval_dates)):
+                        curr_d = all_eval_dates[i]
+                        prev_d = all_eval_dates[i-1]
+                        
+                        # 定義段數起點：昨天不是夜班，今天是夜班
+                        is_start_night = model.NewBoolVar(f'start_night_{emp_id}_{curr_d}')
+                        model.Add(is_start_night == 1).OnlyEnforceIf([is_night[(emp_id, prev_d)].Not(), is_night[(emp_id, curr_d)]])
+                        model.Add(is_start_night == 0).OnlyEnforceIf(is_night[(emp_id, prev_d)])
+                        model.Add(is_start_night == 0).OnlyEnforceIf(is_night[(emp_id, curr_d)].Not())
+                        segment_vars.append(is_start_night)
+                        
+                    total_segments = model.NewIntVar(0, len(all_eval_dates), f'total_n_seg_{emp_id}')
+                    model.Add(total_segments == sum(segment_vars))
+                    
+                    # 2. 防呆防線：如果該員工這個月根本沒上夜班，不該因為沒達到段數要求被扣分
+                    has_night = model.NewBoolVar(f'has_any_night_{emp_id}')
+                    total_night_days = sum(is_night[(emp_id, d)] for d in eval_dates)
+                    model.Add(total_night_days > 0).OnlyEnforceIf(has_night)
+                    model.Add(total_night_days == 0).OnlyEnforceIf(has_night.Not())
+                    
+                    # 3. 依照意願給予相對應的懲罰
+                    if n_seg_pref == '1':
+                        # 喜歡一次上完：段數 > 1 就扣分 (扣分 = 段數 - 1)
+                        pen_var = model.NewIntVar(0, len(all_eval_dates), f'pen_n_seg1_{emp_id}')
+                        model.AddMaxEquality(pen_var, [0, total_segments - 1])
+                        
+                        final_pen = model.NewIntVar(0, len(all_eval_dates), f'final_pen_n_seg1_{emp_id}')
+                        model.Add(final_pen == pen_var).OnlyEnforceIf(has_night)
+                        model.Add(final_pen == 0).OnlyEnforceIf(has_night.Not())
+                        night_segment_penalty_score.append(final_pen)
+                        
+                    elif n_seg_pref == '2':
+                        # 喜歡分兩段：取與 2 的絕對差值 (不到 2 段或超過 2 段都扣分)
+                        diff_var = model.NewIntVar(-len(all_eval_dates), len(all_eval_dates), f'diff_n_seg2_{emp_id}')
+                        model.Add(diff_var == total_segments - 2)
+                        abs_pen_var = model.NewIntVar(0, len(all_eval_dates), f'abs_pen_n_seg2_{emp_id}')
+                        model.AddAbsEquality(abs_pen_var, diff_var)
+                        
+                        final_pen = model.NewIntVar(0, len(all_eval_dates), f'final_pen_n_seg2_{emp_id}')
+                        model.Add(final_pen == abs_pen_var).OnlyEnforceIf(has_night)
+                        model.Add(final_pen == 0).OnlyEnforceIf(has_night.Not())
+                        night_segment_penalty_score.append(final_pen)
+                        
+                    elif n_seg_pref == '3':
+                        # 喜歡分三段以上：段數 < 3 就扣分 (扣分 = 3 - 段數)
+                        pen_var = model.NewIntVar(0, 3, f'pen_n_seg3_{emp_id}')
+                        model.AddMaxEquality(pen_var, [0, 3 - total_segments])
+                        
+                        final_pen = model.NewIntVar(0, 3, f'final_pen_n_seg3_{emp_id}')
+                        model.Add(final_pen == pen_var).OnlyEnforceIf(has_night)
+                        model.Add(final_pen == 0).OnlyEnforceIf(has_night.Not())
+                        night_segment_penalty_score.append(final_pen)
+
+
                 if is_m_level:
                     for d in target_dates:
+                        # 💡 [修改] 加入 c 班別的扣分，維持 B1扣10分、B2扣20分 的邏輯
                         m_level_penalty_score.append(10 * works[(emp_id, d, '01早B1')])
+                        m_level_penalty_score.append(10 * works[(emp_id, d, '01早B1c')])
                         m_level_penalty_score.append(10 * works[(emp_id, d, '01午B1')])
-                        m_level_penalty_score.append(20 * works[(emp_id, d, '01早B2')])
-                        m_level_penalty_score.append(20 * works[(emp_id, d, '01午B2')])
-                        m_level_penalty_score.append(30 * works[(emp_id, d, '01中A')])
+                        m_level_penalty_score.append(10 * works[(emp_id, d, '01午B1c')])
+                        
+                        m_level_penalty_score.append(50 * works[(emp_id, d, '01早B2')])
+                        m_level_penalty_score.append(50 * works[(emp_id, d, '01早B2c')])
+                        m_level_penalty_score.append(50 * works[(emp_id, d, '01午B2')])
+                        m_level_penalty_score.append(50 * works[(emp_id, d, '01午B2c')])
+                        m_level_penalty_score.append(20 * works[(emp_id, d, '01中A')])
                 if is_t_level:
                     for d in target_dates:
                         for s in ['01早M', '01午M']:
                             if (emp_id, d, s) in works:
-                                t_fallback_penalty_score.append(2 * works[(emp_id, d, s)])
+                                t_fallback_penalty_score.append(10 * works[(emp_id, d, s)]) #664
 
                 # A. 班別意願加分
                 if s_pref == 'EARLY':
@@ -655,20 +924,35 @@ class ScheduleEngine:
                         m_shift_bonus_score.append(works[(emp_id, d, '01早m')])
                     if (emp_id, d, '01午m') in works:
                         m_shift_bonus_score.append(works[(emp_id, d, '01午m')])
-                        
+
+            # =========================================================================
             # ⚖️ 執行優化打分 (總分 = 加分 - 連班扣分 - 地點連莊扣分)
-            model.Maximize(
-                WEIGHT_SHIFT_PREF * sum(shift_pref_score) 
-                - WEIGHT_BLOCK_PREF * sum(block_penalty_score)
-                - WEIGHT_LOCATION_MIX * sum(location_penalty_score)
-                - sum(t_fallback_penalty_score) # 💡 [新增] 扣除 t 拿走關鍵班別的退讓分數
-                - sum(m_level_penalty_score)
-                - WEIGHT_BALANCE_EARLY_NOON * sum(balance_penalty_score) # 💡 新增這行：扣除早午班人數差距
-                - sum(global_consec_6_penalties) # 💡 新增這行：扣除全域連六上班的分數
-                - WEIGHT_NIGHT_BALANCE * sum(night_balance_penalty) # 💡 [新增] 扣除 M/Chief 夜班最大與最小人數的差距
-                + WEIGHT_M_SHIFT_BONUS * sum(m_shift_bonus_score) # 💡 [新增] 加分：排入 m 班別
-                - sum(virtual_penalties)
-            )
+            # =========================================================================
+            if debug_mode:
+                # 🐛 [Debug 模式]：無視所有員工的連班偏好、地點輪調、班別意願與公平性
+                # 唯一的目標只有「盡可能不要動用到虛擬人力 (滿足每日上下限)」
+                print("🐛 [Debug 模式] 啟動：無視所有軟限制，僅依勞基法與基本需求暴力求解...")
+                model.Maximize(- sum(virtual_penalties))
+                
+            else:
+                # 🌟 [正常模式]：完整的智慧權重計分板
+                model.Maximize(
+                    WEIGHT_SHIFT_PREF * sum(shift_pref_score) 
+                    - WEIGHT_BLOCK_PREF * sum(block_penalty_score)
+                    - WEIGHT_LOCATION_MIX * sum(location_penalty_score)
+                    - sum(m_level_penalty_score)
+                    - sum(t_fallback_penalty_score)
+                    - WEIGHT_BALANCE_EARLY_NOON * sum(balance_penalty_score)
+                    - sum(global_consec_6_penalties) 
+                    - WEIGHT_NIGHT_BALANCE * sum(night_balance_penalty) 
+                    - WEIGHT_NIGHT_SEGMENT * sum(night_segment_penalty_score) 
+                    - WEIGHT_M_DAY_BALANCE * sum(m_day_balance_penalty)  # 💡 [新增] 扣除 M/m 班分佈不均的違規分數
+                    - WEIGHT_C_SHIFT_BALANCE * sum(c_shift_balance_penalty)  # 💡 [新增] 扣除 C 班分佈不均的違規分數
+                    - WEIGHT_A_SHIFT_BALANCE * sum(a_shift_balance_penalty)  # 💡 [新增] 扣除 中A 班分佈不均的違規分數
+                    - WEIGHT_A_SHIFT_MAX_1 * sum(a_shift_max_penalty)        # 💡 [新增] 扣除 中A 班超過1天的極重度懲罰
+                    + WEIGHT_M_SHIFT_BONUS * sum(m_shift_bonus_score) 
+                    - sum(virtual_penalties)
+                )
 
             solver = cp_model.CpSolver()
             solver.parameters.max_time_in_seconds = 15.0 

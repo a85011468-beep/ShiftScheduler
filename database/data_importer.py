@@ -13,7 +13,7 @@ class DataImporter:
             df = pd.read_excel(excel_path)
             
             # 檢查欄位防呆
-            required_cols = ['emp_id', 'name', 'job_level', 'shift_pref', 'block_pref', 'is_active']
+            required_cols = ['emp_id', 'name', 'job_level', 'shift_pref', 'block_pref', 'is_active', 'night_seg_pref']
             for col in required_cols:
                 if col not in df.columns:
                     return False, f"Excel 缺少必要欄位: {col}"

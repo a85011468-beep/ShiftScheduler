@@ -12,6 +12,7 @@ import pandas as pd
 from engine.solver import ScheduleEngine
 from config.settings import OFF_SHIFTS, ALL_STATES, SHIFT_DEMANDS
 from database.data_importer import DataImporter
+from ui.stats_dialog import StatsDialog
 
 
 class CustomSpinBox(QSpinBox):
@@ -80,6 +81,13 @@ class SchedulerDialog(QDialog):
         self.btn_run.clicked.connect(self.on_run_engine_clicked)
         ctrl_layout.addWidget(self.btn_run)
 
+        # 👇 💡 新增：Debug 排班按鈕 👇
+        self.btn_debug_run = QPushButton("🐛 Debug 勞基法排班")
+        self.btn_debug_run.setStyleSheet("background-color: #9C27B0; color: white; font-weight: bold; height: 35px; padding: 0 15px;")
+        self.btn_debug_run.clicked.connect(self.on_debug_run_clicked)
+        ctrl_layout.addWidget(self.btn_debug_run)
+        # 👆 新增結束 👆
+
         self.btn_import_pre = QPushButton("📥 匯入預排 (Excel)")
         self.btn_import_pre.clicked.connect(self.on_import_pre_schedule_clicked)
         ctrl_layout.addWidget(self.btn_import_pre)
@@ -98,6 +106,12 @@ class SchedulerDialog(QDialog):
         self.btn_export.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; height: 35px; padding: 0 15px;")
         self.btn_export.clicked.connect(self.on_export_clicked)
         ctrl_layout.addWidget(self.btn_export)
+
+        # 🔧 [新增] 週期統計按鈕
+        self.btn_stats = QPushButton("📊 週期班別統計")
+        self.btn_stats.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold; height: 35px; padding: 0 15px;")
+        self.btn_stats.clicked.connect(self.on_stats_clicked)
+        ctrl_layout.addWidget(self.btn_stats)
 
         layout.addLayout(ctrl_layout)
 
@@ -236,12 +250,13 @@ class SchedulerDialog(QDialog):
 
         all_headers = headers_left + date_columns + headers_right
         # 💡 [新增] 定義底部的統計列與對應的班別代碼
+        # 💡 [修改] 將 c 班別合併統計，以維持介面簡潔並正確觸發紅綠燈
         self.stats_rows = [
             ("早M", ["01早M"]), ("早m", ["01早m"]), 
-            ("早B1", ["01早B1"]), ("早B2", ["01早B2"]),
+            ("早B1(含c)", ["01早B1", "01早B1c"]), ("早B2(含c)", ["01早B2", "01早B2c"]),
             ("中A", ["01中A"]), 
             ("午M", ["01午M"]), ("午m", ["01午m"]), 
-            ("午B1", ["01午B1"]), ("午B2", ["01午B2"]), 
+            ("午B1(含c)", ["01午B1", "01午B1c"]), ("午B2(含c)", ["01午B2", "01午B2c"]), 
             ("夜(B1+B2)", ["01夜B1", "01夜B2"])
         ]
 
@@ -481,55 +496,16 @@ class SchedulerDialog(QDialog):
             r_start = len(headers_left) + len(date_columns)
             for i in range(len(headers_right)):
                 self.table.horizontalHeader().resizeSection(r_start + i, 60)
-
-    def on_run_engine_clicked(self):
-        start_date, end_date = self.get_selected_dates()
-        leave_quotas = {}
-        
-        # 取得所有啟用的鍵值 (L, P, r, R + 可能有的 L2, P2, r2, R2)
-        all_keys = self.control_keys_left + self.control_keys_right
-        
-        for emp_id, widgets in self.leave_widgets.items():
-            leave_quotas[emp_id] = {}
-            for k in all_keys:
-                w = widgets.get(k)
-                leave_quotas[emp_id][k] = w.value() if isinstance(w, QSpinBox) else int(w.text()) if w else 0
-            
-        engine = ScheduleEngine(self.db)
-        success, message = engine.run_scheduler(start_date, end_date, leave_quotas, split_date=self.split_date)
-        if success:
-            QMessageBox.information(self, "排班結果", message)
-            self.refresh_table() 
-        else:
-            QMessageBox.warning(self, "排班失敗", message)
-    def on_run_engine_clicked(self):
-        start_date, end_date = self.get_selected_dates()
-        
-        leave_quotas = {}
-        for emp_id, widgets in self.leave_widgets.items():
-            leave_quotas[emp_id] = {}
-            for k in self.control_keys:
-                w = widgets.get(k)
-                leave_quotas[emp_id][k] = w.value() if isinstance(w, QSpinBox) else int(w.text()) if w else 0
-            
-        engine = ScheduleEngine(self.db)
-        # 💡 將分裂日期傳入引擎
-        success, message = engine.run_scheduler(start_date, end_date, leave_quotas, split_date=self.split_date)
-        if success:
-            QMessageBox.information(self, "排班結果", message)
-            self.refresh_table() 
-        else:
-            QMessageBox.warning(self, "排班失敗", message)
-
-            
+          
     def on_run_engine_clicked(self):
         start_date, end_date = self.get_selected_dates()
         leave_quotas = {}
         
         # 🛡️ 安全取得左右兩側的 keys，確保不會因為重新整理狀態丟失而落空
-        all_keys = getattr(self, 'control_keys_left', ['L', 'P', 'r', 'R'])
+        # 💡 [修正] 一併補齊 'O'，並使用 list() 複製
+        all_keys = list(getattr(self, 'control_keys_left', ['L', 'P', 'r', 'R', 'O']))
         if getattr(self, 'split_date', None):
-            all_keys += getattr(self, 'control_keys_right', ['L2', 'P2', 'r2', 'R2'])
+            all_keys.extend(getattr(self, 'control_keys_right', ['L2', 'P2', 'r2', 'R2', 'O2']))
             
         for emp_id, widgets in self.leave_widgets.items():
             leave_quotas[emp_id] = {}
@@ -557,6 +533,100 @@ class SchedulerDialog(QDialog):
             self.refresh_table() 
         else:
             QMessageBox.warning(self, "排班失敗", message)
+
+    def on_debug_run_clicked(self):
+        start_date, end_date = self.get_selected_dates()
+        dates = pd.date_range(start=start_date, end=end_date).tolist()
+        num_days = len(dates)
+
+        # 1. 取得當前區間上下限參數
+        from config.settings import SHIFT_DEMANDS
+        daily_min = sum(req[0] for req in SHIFT_DEMANDS.values())
+        daily_max = sum(req[1] for req in SHIFT_DEMANDS.values())
+        cycle_min_demand = daily_min * num_days
+        cycle_max_demand = daily_max * num_days
+
+        # 2. 取得可用總人力基數
+        active_employees = self.db.get_all_active_employees()
+        num_employees = len(active_employees)
+        total_theoretical_slots = num_employees * num_days
+
+        # 3. 從畫面的 SpinBox 收集休假與加班資料，並計算「只休假」的天數
+        total_off_days = 0
+        leave_quotas = {}
+        
+        # 定義哪些狀態是純休假 (不包含 O 加班)
+        off_keys_left = ['L', 'P', 'r', 'R']
+        off_keys_right = ['L2', 'P2', 'r2', 'R2']
+        all_off_keys = off_keys_left
+        if getattr(self, 'split_date', None):
+            all_off_keys += off_keys_right
+
+        # 必須抓取所有的 keys (包含 O) 送給引擎
+        # 💡 [修正] 使用 list() 強制複製陣列，避免污染原生的 self.control_keys_left
+        all_keys = list(getattr(self, 'control_keys_left', ['L', 'P', 'r', 'R', 'O']))
+        if getattr(self, 'split_date', None):
+            all_keys.extend(getattr(self, 'control_keys_right', ['L2', 'P2', 'r2', 'R2', 'O2']))
+
+        for emp_id, widgets in self.leave_widgets.items():
+            leave_quotas[emp_id] = {}
+            for k in all_keys:
+                w = widgets.get(k)
+                val = 0
+                if w is not None:
+                    try:
+                        val = w.value() 
+                    except AttributeError:
+                        try:
+                            val = int(w.text())
+                        except (ValueError, TypeError):
+                            val = 0
+                leave_quotas[emp_id][k] = val
+                
+                # 如果這個 key 是休假，就計入總休假天數
+                if k in all_off_keys:
+                    total_off_days += val
+
+        # 4. 計算最終實質可用人力數 = (總員工 * 總天數) - 總休假數
+        available_manpower = total_theoretical_slots - total_off_days
+
+        # 5. 組合分析報告並彈出診斷視窗
+        msg = (f"📊 【排班數據物理診斷】\n\n"
+               f"📅 區間：{start_date} 至 {end_date} (共 {num_days} 天)\n"
+               f"👥 啟用人數：{num_employees} 人\n"
+               f"🛏️ QSpinBox休假總數：{total_off_days} 天\n"
+               f"----------------------------------------\n"
+               f"🎯 本週期總需求下限：{cycle_min_demand} 人次\n"
+               f"🎯 本週期總需求上限：{cycle_max_demand} 人次\n"
+               f"💪 實際可用總人力：{available_manpower} 人次\n\n")
+
+        # 附上智慧提示
+        if available_manpower < cycle_min_demand:
+            msg += "⚠️ 警告：可用人力低於最低需求下限！\n(引擎必定無法排出完整班表，將動用百萬罰分虛擬人力)\n"
+        elif available_manpower > cycle_max_demand:
+            msg += "⚠️ 警告：可用人力高於最高需求上限！\n(代表這週期有人一定排不滿，被迫休無薪假或變成待命狀態)\n"
+        else:
+            msg += "✅ 評估：人力落在安全容許區間內。\n"
+
+        msg += "\n是否確認繼續執行「僅依勞基法」的 Debug 排班？"
+
+        reply = QMessageBox.question(self, "Debug 排班診斷 (純物理限制)", msg, QMessageBox.Yes | QMessageBox.No)
+        
+        if reply == QMessageBox.Yes:
+            engine = ScheduleEngine(self.db)
+            try:
+                # 💡 傳遞 debug_mode=True 標記給引擎
+                success, message = engine.run_scheduler(start_date, end_date, leave_quotas, split_date=getattr(self, 'split_date', None), debug_mode=True)
+            except TypeError:
+                # 容錯處理：如果 solver.py 尚未實作接受 debug_mode 參數，就先呼叫原本的引擎
+                QMessageBox.warning(self, "系統提示", "引擎端 (solver.py) 尚未開啟 debug_mode 支援，本次將以正常智能排班執行。")
+                success, message = engine.run_scheduler(start_date, end_date, leave_quotas, split_date=getattr(self, 'split_date', None))
+
+            if success:
+                QMessageBox.information(self, "排班結果", message)
+                self.refresh_table() 
+            else:
+                QMessageBox.warning(self, "排班失敗", message)
 
 
     # 🔧 [功能二] 實作安全刪除邏輯
@@ -591,6 +661,14 @@ class SchedulerDialog(QDialog):
                 
             except Exception as e:
                 QMessageBox.critical(self, "錯誤", f"刪除過程中發生異常：\n{str(e)}")
+
+    def on_stats_clicked(self):
+        """開啟班別統計與負債檢核視窗"""
+        start_date, end_date = self.get_selected_dates()
+        
+        # 實例化並開啟統計視窗 (傳入 db_manager 以及目前的日期區間)
+        dialog = StatsDialog(self.db, start_date, end_date, self)
+        dialog.exec()
 
     def on_export_clicked(self):
         start_date, end_date = self.get_selected_dates()
