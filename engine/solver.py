@@ -23,7 +23,7 @@ class ScheduleEngine:
         conn.commit()
         conn.close()
 
-    def _run_pre_flight_diagnostics(self, emp_ids, eval_dates, dict_sched, dict_history, job_levels, shift_prefs, leave_quotas):
+    def _run_pre_flight_diagnostics(self, emp_ids, eval_dates, dict_sched, dict_history, job_levels, shift_prefs, leave_quotas, split_date=None):
         diagnostics = []
         
         # 1. 建立全局鎖定看板 (合併歷史紀錄與未來的圖釘)
@@ -110,12 +110,26 @@ class ScheduleEngine:
             
             if user_R_quota < required_Rs:
                 diagnostics.append(f"[配額死結] {eid} 依 7 天區塊劃分，必須排 {required_Rs} 天例假(R)。但系統讀到的設定配額僅 {user_R_quota} 天。請確認 QSpinBox 總和。")
+        # ==========================================
+        # 🛡️ 檢核 6：圖釘數量是否大於 QSpinBox 額度 (回歸單一區間)
+        # ==========================================
+        check_shifts = ['L', 'P', 'R', 'r', 'O']
+        for emp_id in emp_ids:
+            eid = str(emp_id).strip()
+            q = leave_quotas.get(eid, {})
+            
+            for shift in check_shifts:
+                locked_all = sum(1 for d in eval_dates if locked_board.get((emp_id, d)) == shift)
+                quota_all = int(q.get(shift, 0))
+                if locked_all > quota_all:
+                    diagnostics.append(f"[額度死結] {eid} 期間內被圖釘釘了 {locked_all} 天 {shift}，但 QSpinBox 額度僅給予 {quota_all}。")
+
 
         # 回傳去重複的錯誤清單
         return list(set(diagnostics))
 
 
-    def run_scheduler(self, start_date, end_date, leave_quotas=None, split_date=None, debug_mode=False, rule_config=None):
+    def run_scheduler(self, start_date, end_date, leave_quotas=None, debug_mode=False, rule_config=None):
         if leave_quotas is None: leave_quotas = {}
         if rule_config is None: rule_config = {}  # 確保預設為空字典防呆
         
@@ -263,36 +277,14 @@ class ScheduleEngine:
             # =========================================================================
             if strict_quotas:
                 for emp_id in emp_ids:
-                    eid = str(emp_id).strip()
-                    q = leave_quotas.get(eid, {})
+                    q = leave_quotas.get(str(emp_id).strip(), {})
                     
-                    if split_date and eval_dates[0] <= split_date < eval_dates[-1]:
-                        p1_dates = [d for d in eval_dates if d <= split_date]
-                        p2_dates = [d for d in eval_dates if d > split_date]
-                        
-                        # 區間 1 (期內) 限制
-                        model.Add(sum(works[(emp_id, d, 'L')] for d in p1_dates) == q.get('L', 0))
-                        model.Add(sum(works[(emp_id, d, 'P')] for d in p1_dates) == q.get('P', 0))
-                        model.Add(sum(works[(emp_id, d, 'r')] for d in p1_dates) == q.get('r', 0))
-                        model.Add(sum(works[(emp_id, d, 'R')] for d in p1_dates) == q.get('R', 0))
-                        # 💡 強制配發期內加班日數
-                        model.Add(sum(is_overtime_vars[(emp_id, d)] for d in p1_dates) == q.get('O', 0))
-                        
-                        # 區間 2 (跨出) 限制
-                        model.Add(sum(works[(emp_id, d, 'L')] for d in p2_dates) == q.get('L2', 0))
-                        model.Add(sum(works[(emp_id, d, 'P')] for d in p2_dates) == q.get('P2', 0))
-                        model.Add(sum(works[(emp_id, d, 'r')] for d in p2_dates) == q.get('r2', 0))
-                        model.Add(sum(works[(emp_id, d, 'R')] for d in p2_dates) == q.get('R2', 0))
-                        # 💡 強制配發跨出加班日數
-                        model.Add(sum(is_overtime_vars[(emp_id, d)] for d in p2_dates) == q.get('O2', 0))
-                    else:
-                        # 未跨界的常規單一約束
-                        model.Add(sum(works[(emp_id, d, 'L')] for d in eval_dates) == q.get('L', 0))
-                        model.Add(sum(works[(emp_id, d, 'P')] for d in eval_dates) == q.get('P', 0))
-                        model.Add(sum(works[(emp_id, d, 'r')] for d in eval_dates) == q.get('r', 0))
-                        model.Add(sum(works[(emp_id, d, 'R')] for d in eval_dates) == q.get('R', 0))
-                        # 💡 強制配發總加班日數
-                        model.Add(sum(is_overtime_vars[(emp_id, d)] for d in eval_dates) == q.get('O', 0))
+                    # 💡 徹底刪除所有 split_date 判斷，回歸最單純的單一區間加總
+                    model.Add(sum(works[(emp_id, d, 'L')] for d in eval_dates) == q.get('L', 0))
+                    model.Add(sum(works[(emp_id, d, 'P')] for d in eval_dates) == q.get('P', 0))
+                    model.Add(sum(works[(emp_id, d, 'r')] for d in eval_dates) == q.get('r', 0))
+                    model.Add(sum(works[(emp_id, d, 'R')] for d in eval_dates) == q.get('R', 0))
+                    model.Add(sum(is_overtime_vars[(emp_id, d)] for d in eval_dates) == q.get('O', 0))
                     
                     # 💡 [移除] 把 01中A 和 01泛用 的強迫配額刪除！
                     # 引擎現在可以為了大局，自由地把中A和泛用發放給合適的員工。

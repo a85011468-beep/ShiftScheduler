@@ -601,24 +601,12 @@ class SchedulerDialog(QDialog):
         total_off_m = 0
         total_off_n = 0
         leave_quotas = {}
-        
-        off_keys_left = ['L', 'P', 'r', 'R']
-        off_keys_right = ['L2', 'P2', 'r2', 'R2']
-        all_off_keys = off_keys_left
-        if getattr(self, 'split_date', None):
-            all_off_keys = off_keys_left + off_keys_right
-
-        all_keys = list(getattr(self, 'control_keys_left', ['L', 'P', 'r', 'R', 'O']))
-        if getattr(self, 'split_date', None):
-            all_keys.extend(getattr(self, 'control_keys_right', ['L2', 'P2', 'r2', 'R2', 'O2']))
-
-        manager_ids = [str(e['emp_id']).strip() for e in managers]
-
+        standard_keys = ['L', 'P', 'r', 'R', 'O']
+            
         for emp_id, widgets in self.leave_widgets.items():
             eid_str = str(emp_id).strip()
             leave_quotas[eid_str] = {}
-            emp_off_days = 0
-            for k in all_keys:
+            for k in standard_keys:
                 w = widgets.get(k)
                 val = 0
                 if w is not None:
@@ -722,11 +710,8 @@ class SchedulerDialog(QDialog):
         leave_quotas = {}
         
         # 定義哪些狀態是純休假 (不包含 O 加班)
-        off_keys_left = ['L', 'P', 'r', 'R']
-        off_keys_right = ['L2', 'P2', 'r2', 'R2']
-        all_off_keys = off_keys_left
-        if getattr(self, 'split_date', None):
-            all_off_keys = off_keys_left + off_keys_right
+        standard_keys = ['L', 'P', 'r', 'R', 'O']
+        all_off_keys = standard_keys[:-1]  # 最後一個 O 是加班，不算在休假天數裡
 
         # 使用 list() 強制複製陣列，避免污染原生控制設定
         all_keys = list(getattr(self, 'control_keys_left', ['L', 'P', 'r', 'R', 'O']))
@@ -738,8 +723,7 @@ class SchedulerDialog(QDialog):
         for emp_id, widgets in self.leave_widgets.items():
             eid_str = str(emp_id).strip()
             leave_quotas[eid_str] = {}
-            emp_off_days = 0
-            for k in all_keys:
+            for k in standard_keys:
                 w = widgets.get(k)
                 val = 0
                 if w is not None:
