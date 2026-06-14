@@ -361,16 +361,19 @@ class ScheduleEngine:
             # 🛡️ 連班與例假防線 (取代原有的單純 is_working 判斷)
             # =========================================================================
             # 準備「週日到週六」的日期分組字典，用來限制例假 (R)
-            weeks_dict = {}
-            for d_str in all_eval_dates:
-                d_obj = datetime.strptime(d_str, '%Y-%m-%d')
-                # weekday(): 0 是週一, 6 是週日。計算距離本週日的差值以求出週日日期
-                days_since_sun = (d_obj.weekday() + 1) % 7 
-                sun_date = d_obj - timedelta(days=days_since_sun)
-                sun_str = sun_date.strftime('%Y-%m-%d')
-                if sun_str not in weeks_dict:
-                    weeks_dict[sun_str] = []
-                weeks_dict[sun_str].append(d_str)
+            # 💡 [修改] 如果是 Debug 模式，直接跳過所有的七休一、每週一例與四連休防線
+            if not debug_mode:
+
+                weeks_dict = {}
+                for d_str in all_eval_dates:
+                    d_obj = datetime.strptime(d_str, '%Y-%m-%d')
+                    # weekday(): 0 是週一, 6 是週日。計算距離本週日的差值以求出週日日期
+                    days_since_sun = (d_obj.weekday() + 1) % 7 
+                    sun_date = d_obj - timedelta(days=days_since_sun)
+                    sun_str = sun_date.strftime('%Y-%m-%d')
+                    if sun_str not in weeks_dict:
+                        weeks_dict[sun_str] = []
+                    weeks_dict[sun_str].append(d_str)
 
             for emp_id in emp_ids:
                 # 條件 1：任何連續 7 天內，(上班 + P + L) 最多只能 6 天
@@ -427,7 +430,7 @@ class ScheduleEngine:
                             model.Add(sum(is_off[(emp_id, d)] for d in window_dates) <= 3)
 
             # 5. 交接班時序防線
-            if strict_time_rules:
+            if strict_time_rules and not debug_mode:
                 for emp_id in emp_ids:
                     s_pref = shift_prefs.get(str(emp_id).strip(), 'MIX')
                     for i in range(len(all_eval_dates) - 1):

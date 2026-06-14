@@ -23,6 +23,18 @@ class RunConfigDialog(QDialog):
         # ==========================================
         group_hard = QGroupBox("🚨 物理與勞基法防線 (硬限制)")
         layout_hard = QVBoxLayout()
+
+        # 💡 [新增] 左側全選與全不選按鈕
+        btn_layout_hard = QHBoxLayout()
+        btn_all_hard = QPushButton("✅ 全選")
+        btn_none_hard = QPushButton("❌ 全不選")
+        btn_all_hard.clicked.connect(lambda: self.toggle_hard_rules(True))
+        btn_none_hard.clicked.connect(lambda: self.toggle_hard_rules(False))
+        btn_layout_hard.addWidget(btn_all_hard)
+        btn_layout_hard.addWidget(btn_none_hard)
+        layout_hard.addLayout(btn_layout_hard)
+        layout_hard.addSpacing(5)
+        
         
         # 強制鎖定不可取消的項目
         self.cb_law_7_in_1 = self._create_checkbox("七休一 (連續7天必有1休)", True, disabled=True)
@@ -51,6 +63,17 @@ class RunConfigDialog(QDialog):
         # ==========================================
         group_soft = QGroupBox("⚖️ 偏好與公平性優化 (軟限制)")
         layout_soft = QVBoxLayout()
+
+        # 💡 [新增] 右側全選與全不選按鈕
+        btn_layout_soft = QHBoxLayout()
+        btn_all_soft = QPushButton("✅ 全選")
+        btn_none_soft = QPushButton("❌ 全不選")
+        btn_all_soft.clicked.connect(lambda: self.toggle_soft_rules(True))
+        btn_none_soft.clicked.connect(lambda: self.toggle_soft_rules(False))
+        btn_layout_soft.addWidget(btn_all_soft)
+        btn_layout_soft.addWidget(btn_none_soft)
+        layout_soft.addLayout(btn_layout_soft)
+        layout_soft.addSpacing(5)
         
         self.cb_shift_pref = self._create_checkbox("優先滿足員工【班別】意願", True)
         self.cb_block_pref = self._create_checkbox("優先滿足員工【連班】偏好", True)
@@ -103,7 +126,25 @@ class RunConfigDialog(QDialog):
             cb.setDisabled(True)
             cb.setStyleSheet("color: #9E9E9E;") # 反灰字體
         return cb
+    
+    # 💡 [新增] 硬規則切換邏輯 (避開勞基法鎖定項目)
+    def toggle_hard_rules(self, state):
+        self.cb_strict_quotas.setChecked(state)
+        self.cb_mid_a.setChecked(state)
+        self.cb_no_4_off.setChecked(state)
 
+    # 💡 [新增] 軟規則切換邏輯
+    def toggle_soft_rules(self, state):
+        self.cb_shift_pref.setChecked(state)
+        self.cb_block_pref.setChecked(state)
+        self.cb_loc_mix.setChecked(state)
+        self.cb_night_seg.setChecked(state)
+        self.cb_bal_early_noon.setChecked(state)
+        self.cb_bal_night.setChecked(state)
+        self.cb_bal_m_day.setChecked(state)
+        self.cb_bal_c.setChecked(state)
+        self.cb_bal_a.setChecked(state)
+        
     def get_config(self):
         """將 UI 的勾選狀態打包成 Dictionary 供引擎讀取"""
         return {

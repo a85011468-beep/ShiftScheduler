@@ -641,15 +641,16 @@ class SchedulerDialog(QDialog):
         else:
             msg += "✅ 評估：人力落在安全容許區間內。\n"
 
-        msg += "\n是否確認繼續執行「僅依勞基法」的 Debug 排班？"
+        # 💡 [修改] 更改彈出視窗的說明文字
+        msg += "\n是否確認執行【終極暴力 Debug】？\n(⚠️ 警告：此模式將徹底無視七休一、交接班相剋等所有勞基法規則，僅為測試「人數物理極限」而存在！)"
 
-        reply = QMessageBox.question(self, "Debug 排班診斷 (純物理限制)", msg, QMessageBox.Yes | QMessageBox.No)
+        reply = QMessageBox.question(self, "暴力 Debug (無視法規)", msg, QMessageBox.Yes | QMessageBox.No)
         
         if reply == QMessageBox.Yes:
             engine = ScheduleEngine(self.db)
             try:
-                # 💡 傳遞 debug_mode=True 標記給引擎
-                success, message = engine.run_scheduler(start_date, end_date, leave_quotas, split_date=getattr(self, 'split_date', None), debug_mode=True)
+                # 💡 傳遞 debug_mode=True 標記給引擎，且為了保險起見傳入空 rule_config
+                success, message = engine.run_scheduler(start_date, end_date, leave_quotas, split_date=getattr(self, 'split_date', None), debug_mode=True, rule_config={})
             except TypeError:
                 # 容錯處理：如果 solver.py 尚未實作接受 debug_mode 參數，就先呼叫原本的引擎
                 QMessageBox.warning(self, "系統提示", "引擎端 (solver.py) 尚未開啟 debug_mode 支援，本次將以正常智能排班執行。")
