@@ -123,8 +123,9 @@ class ScheduleEngine:
         return list(set(diagnostics))
 
 
-    def run_scheduler(self, start_date, end_date, leave_quotas=None, split_date=None, debug_mode=False):
+    def run_scheduler(self, start_date, end_date, leave_quotas=None, split_date=None, debug_mode=False, rule_config=None):
         if leave_quotas is None: leave_quotas = {}
+        if rule_config is None: rule_config = {}  # 確保預設為空字典防呆
         
         employees = self.db.get_all_active_employees()
         if not employees:
@@ -164,7 +165,7 @@ class ScheduleEngine:
             error_msg += "\n\n💡 引擎已被攔截保護。請至排班面板調整「特休配額」或解除衝突的「圖釘鎖定」。"
             return False, error_msg
 
-        def attempt_solve(strict_time_rules=True, strict_quotas=True):
+        def attempt_solve(strict_time_rules=True, strict_quotas=rule_config.get('strict_quotas', True)):
             model = cp_model.CpModel()
             works = {}
 
@@ -340,20 +341,21 @@ class ScheduleEngine:
             # =========================================================================
             # 4.5 動態硬限制：單雙數決定中A班 (依賴 is_working)
             # =========================================================================
-            for date in eval_dates:
+            if rule_config.get('hard_mid_a', True):
+                for date in eval_dates:
                 # 1. 取得該日「總上班人數」(使用剛剛步驟4定義好的 is_working)
-                total_working_d = sum(is_working[(emp_id, date)] for emp_id in emp_ids)
+                    total_working_d = sum(is_working[(emp_id, date)] for emp_id in emp_ids)
                 
                 # 2. 取得該日被排入 '01中A' 的總人數
-                mid_a_count = sum(works[(emp_id, date, '01中A')] for emp_id in emp_ids if (emp_id, date, '01中A') in works)
+                    mid_a_count = sum(works[(emp_id, date, '01中A')] for emp_id in emp_ids if (emp_id, date, '01中A') in works)
                 
                 # 3. 單雙數商數與餘數判定
-                max_q = len(emp_ids) // 2 + 1
-                q_var = model.NewIntVar(0, max_q, f'q_working_{date}')
-                model.Add(total_working_d == 2 * q_var + mid_a_count)
+                    max_q = len(emp_ids) // 2 + 1
+                    q_var = model.NewIntVar(0, max_q, f'q_working_{date}')
+                    model.Add(total_working_d == 2 * q_var + mid_a_count)
                 
                 # 4. 防呆機制：確保中A人數絕對不超過 1
-                model.Add(mid_a_count <= 1)
+                    model.Add(mid_a_count <= 1)
 
             # =========================================================================
             # 🛡️ 連班與例假防線 (取代原有的單純 is_working 判斷)
@@ -400,26 +402,29 @@ class ScheduleEngine:
                             else:
                                 window_R.append(works[(emp_id, d, 'R')])
                         model.Add(sum(window_R) == 1)
-                # 👇 💡 [新增] 條件 3：拒絕引擎連續四天休假 (預排圖釘四天以上除外)
-                for i in range(len(all_eval_dates) - 3):
-                    window_dates = [all_eval_dates[i+j] for j in range(4)]
+
+                # 💡 [修改] 加入控制台判斷
+                if rule_config.get('hard_no_4_off', True):            
+                    # 👇 💡 [新增] 條件 3：拒絕引擎連續四天休假 (預排圖釘四天以上除外)
+                    for i in range(len(all_eval_dates) - 3):
+                        window_dates = [all_eval_dates[i+j] for j in range(4)]
                     
-                    # 計算這 4 天內，有幾天是「歷史紀錄的休假」或「未來被人工鎖定的休假」
-                    locked_off_count = 0
-                    for d in window_dates:
-                        if d < eval_dates[0]: # 過去的歷史紀錄
-                            shift = dict_history.get((emp_id, d))
-                            if shift in OFF_SHIFTS:
-                                locked_off_count += 1
-                        else:                 # 未來需排班的日子
-                            record = dict_sched.get((emp_id, d))
-                            if record and record['is_locked'] == 1 and record['shift_code'] in OFF_SHIFTS:
-                                locked_off_count += 1
+                        # 計算這 4 天內，有幾天是「歷史紀錄的休假」或「未來被人工鎖定的休假」
+                        locked_off_count = 0
+                        for d in window_dates:
+                            if d < eval_dates[0]: # 過去的歷史紀錄
+                                shift = dict_history.get((emp_id, d))
+                                if shift in OFF_SHIFTS:
+                                    locked_off_count += 1
+                            else:                 # 未來需排班的日子
+                                record = dict_sched.get((emp_id, d))
+                                if record and record['is_locked'] == 1 and record['shift_code'] in OFF_SHIFTS:
+                                    locked_off_count += 1
                     
                     # 💡 判斷：若這 4 天「沒有全部被人工鎖死為休假」
                     # 代表引擎有權限排定其中至少 1 天，我們就強制限制這 4 天的休假總和不得超過 3 天
-                    if locked_off_count < 4:
-                        model.Add(sum(is_off[(emp_id, d)] for d in window_dates) <= 3)
+                        if locked_off_count < 4:
+                            model.Add(sum(is_off[(emp_id, d)] for d in window_dates) <= 3)
 
             # 5. 交接班時序防線
             if strict_time_rules:
@@ -448,17 +453,21 @@ class ScheduleEngine:
             # =========================================================================
             # 🎯 權重優化核心 (軟限制打分)
             # =========================================================================
-            WEIGHT_SHIFT_PREF = 10       
-            WEIGHT_LOCATION_MIX = 30      # 💡 中等權重：避免連兩天同地點
-            WEIGHT_BLOCK_PREF = 5
-            WEIGHT_BALANCE_EARLY_NOON = 50 # 💡 [新增] 早午班平均權重 (設定為 3，讓它具有一定影響力但不至於蓋過員工意願) 
-            WEIGHT_NIGHT_BALANCE = 50      # 💡 [新增] 夜班平分權重 (差距 1 天就扣 5 分)       
-            WEIGHT_M_SHIFT_BONUS = 1      # 💡 [新增] m 班別優先權重 (+1分)
-            WEIGHT_NIGHT_SEGMENT = 10     # 💡 [新增] 夜班分段偏好的扣分權重
-            WEIGHT_M_DAY_BALANCE = 5      # 💡 [新增] 日間主管班 (M/m) 平分的扣分權重
-            WEIGHT_C_SHIFT_BALANCE = 5    # 💡 [新增] Normal 員工 C 班平分的扣分權重
-            WEIGHT_A_SHIFT_BALANCE = 5    # 💡 [新增] 中A班平分的扣分權重
+            WEIGHT_SHIFT_PREF = 10 if rule_config.get('soft_shift_pref', True) else 0       
+            WEIGHT_BLOCK_PREF = 5  if rule_config.get('soft_block_pref', True) else 0
+            WEIGHT_LOCATION_MIX = 5 if rule_config.get('soft_loc_mix', True) else 0      # 💡 中等權重：避免連兩天同地點
+            WEIGHT_NIGHT_SEGMENT = 10 if rule_config.get('soft_night_seg', True) else 0     # 💡 [新增] 夜班分段偏好的扣分權重
+
+
+            WEIGHT_BALANCE_EARLY_NOON = 100 if rule_config.get('soft_bal_early_noon', True) else 0 # 💡 [新增] 早午班平均權重 (設定為 3，讓它具有一定影響力但不至於蓋過員工意願) 
+            WEIGHT_NIGHT_BALANCE = 50 if rule_config.get('soft_bal_night', True) else 0      # 💡 [新增] 夜班平分權重 (差距 1 天就扣 5 分)       
+            WEIGHT_M_DAY_BALANCE = 5 if rule_config.get('soft_bal_m_day', True) else 0       # 💡 [新增] 日間主管班 (M/m) 平分的扣分權重
+            WEIGHT_C_SHIFT_BALANCE = 5 if rule_config.get('soft_bal_c', True) else 0        # 💡 [新增] Normal 員工 C 班平分的扣分權重
+ 
+            WEIGHT_A_SHIFT_BALANCE = 5 if rule_config.get('soft_bal_a', True) else 0    # 💡 [新增] 中A班平分的扣分權重
+           
             WEIGHT_A_SHIFT_MAX_1 = 50     # 💡 [新增] 中A班超過1天的極重度防線權重
+            WEIGHT_M_SHIFT_BONUS = 1      # 💡 [新增] m 班別優先權重 (+1分)
 
             shift_pref_score = []
             block_penalty_score = []
@@ -955,7 +964,7 @@ class ScheduleEngine:
                 )
 
             solver = cp_model.CpSolver()
-            solver.parameters.max_time_in_seconds = 15.0 
+            solver.parameters.max_time_in_seconds = 120.0 
             return solver.Solve(model), solver, works, virtual_vars_dict
             # 💡 回傳時多帶上虛擬人力的變數字典
 
