@@ -86,6 +86,7 @@ class RunConfigDialog(QDialog):
         self.cb_bal_m_day = self._create_checkbox("平分：早M/午M天數平均 + 負債制", True)
         self.cb_bal_c = self._create_checkbox("平分：基層 C 班天數平均 + 負債制", True)
         self.cb_bal_a = self._create_checkbox("平分：中A班天數平均 + 負債制", True)
+        self.cb_bal_support = self._create_checkbox("平分：溢流支援班(日)天數平均 + 負債制", True) # 💡 新增
         
         layout_soft.addWidget(self.cb_shift_pref)
         layout_soft.addWidget(self.cb_block_pref)
@@ -96,6 +97,7 @@ class RunConfigDialog(QDialog):
         layout_soft.addWidget(self.cb_bal_m_day)
         layout_soft.addWidget(self.cb_bal_c)
         layout_soft.addWidget(self.cb_bal_a)
+        layout_soft.addWidget(self.cb_bal_support) # 💡 新增
         layout_soft.addStretch()
         group_soft.setLayout(layout_soft)
         
@@ -144,6 +146,7 @@ class RunConfigDialog(QDialog):
         self.cb_bal_m_day.setChecked(state)
         self.cb_bal_c.setChecked(state)
         self.cb_bal_a.setChecked(state)
+        self.cb_bal_support.setChecked(state) # 💡 新增
         
     def get_config(self):
         """將 UI 的勾選狀態打包成 Dictionary 供引擎讀取"""
@@ -161,5 +164,6 @@ class RunConfigDialog(QDialog):
             'soft_bal_night': self.cb_bal_night.isChecked(),
             'soft_bal_m_day': self.cb_bal_m_day.isChecked(),
             'soft_bal_c': self.cb_bal_c.isChecked(),
-            'soft_bal_a': self.cb_bal_a.isChecked()
+            'soft_bal_a': self.cb_bal_a.isChecked(),
+            'soft_bal_support': self.cb_bal_support.isChecked() # 💡 新增
         }

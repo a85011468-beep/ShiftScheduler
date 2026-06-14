@@ -41,10 +41,10 @@ class StatsDialog(QDialog):
 
         # 統計表格
         self.table = QTableWidget()
-        self.table.setColumnCount(7)
+        self.table.setColumnCount(8)
         self.table.setHorizontalHeaderLabels([
             "員工編號", "姓名", "職級", "中A班總數", 
-            "主管夜班 (M/Chief)", "基層 C班 (Normal)", "基層早午班 (Normal)"
+            "主管夜班 (M/Chief)", "基層 C班 (Normal)", "基層早午班 (Normal)", "支援待命 (日)"
         ])
         self.table.setAlternatingRowColors(True)
         self.table.setStyleSheet("QTableWidget { font-size: 14px; alternate-background-color: #f9f9f9; }")
@@ -73,7 +73,8 @@ class StatsDialog(QDialog):
                 'mid_a': 0,
                 'm_night': 0,
                 'normal_c': 0,
-                'normal_day': 0
+                'normal_day': 0,
+                'support_day': 0  # 💡 新增
             }
 
         # 2. 取得區間內所有排班紀錄
@@ -91,6 +92,8 @@ class StatsDialog(QDialog):
             # 統計：中A班 (所有人)
             if shift == '01中A':
                 stats[eid]['mid_a'] += 1
+            elif shift == '日':       # 💡 新增統計邏輯
+                stats[eid]['support_day'] += 1
                 
             # 統計：主管夜班
             if level in ['M', 'Chief'] and shift in NIGHT_SHIFTS:
@@ -122,8 +125,9 @@ class StatsDialog(QDialog):
             str_m_night = str(data['m_night']) if is_m else "-"
             str_norm_c = str(data['normal_c']) if not is_m else "-"
             str_norm_day = str(data['normal_day']) if not is_m else "-"
+            str_support = str(data['support_day']) # 💡 所有人都可能上支援班
             
-            row_data = [eid, data['name'], lvl, str_mid_a, str_m_night, str_norm_c, str_norm_day]
+            row_data = [eid, data['name'], lvl, str_mid_a, str_m_night, str_norm_c, str_norm_day, str_support]
             
             for col_idx, text in enumerate(row_data):
                 item = QTableWidgetItem(text)
@@ -142,6 +146,7 @@ class StatsDialog(QDialog):
                     if col_idx == 4: item.setForeground(QColor("#311B92")) # 主管夜班深紫
                     if col_idx == 5: item.setForeground(QColor("#B71C1C")) # C班深紅
                     if col_idx == 6: item.setForeground(QColor("#0D47A1")) # 早午深藍
+                    if col_idx == 7: item.setForeground(QColor("#004D40")) # 💡 支援班深綠色
                 
                 self.table.setItem(row_idx, col_idx, item)
 

@@ -83,32 +83,24 @@ class ScheduleEngine:
                     diagnostics.append(f"[{window[0]}至{window[-1]}] {eid} 被連續圖釘鎖死 7 天無休息日，違反七休一。")
 
         # ==========================================
-        # 🛡️ 檢核 4 & 5：靜態週一例 (R==1) 與配額死結
+        # 🛡️ 檢核 4 & 5：自訂週期 R 假防線與配額死結 (取代自然週)
         # ==========================================
-        weeks_dict = {}
-        for d_str in all_eval_dates:
-            d_obj = datetime.strptime(d_str, '%Y-%m-%d')
-            days_since_sun = (d_obj.weekday() + 1) % 7 
-            sun_date = d_obj - timedelta(days=days_since_sun)
-            sun_str = sun_date.strftime('%Y-%m-%d')
-            if sun_str not in weeks_dict: weeks_dict[sun_str] = []
-            weeks_dict[sun_str].append(d_str)
-
         for emp_id in emp_ids:
             eid = str(emp_id).strip()
             required_Rs = 0
             
-            for sun_str, week_dates in weeks_dict.items():
-                if len(week_dates) == 7 and any(d >= eval_dates[0] for d in week_dates):
-                    # 檢核 4：單週被釘了超過 1 個 R
-                    locked_Rs = sum(1 for d in week_dates if locked_board.get((emp_id, d)) == 'R')
-                    if locked_Rs > 1:
-                        diagnostics.append(f"[{sun_str}週] {eid} 該週被鎖定了 {locked_Rs} 天例假(R)，違反「每週僅能1例」規定。")
-                    
-                    # 計算引擎在這週「被迫」一定要排幾個 R
-                    has_history_R = any(locked_board.get((emp_id, d)) == 'R' for d in week_dates if d < eval_dates[0])
-                    if not has_history_R:
-                        required_Rs += 1
+            # 💡 依使用者需求：從排班第一天起，每 7 天切一個固定區塊
+            for i in range(0, len(eval_dates), 7):
+                chunk_dates = eval_dates[i:i+7]
+                
+                # 檢核 4：單一區塊被人工釘了超過 1 個 R
+                locked_Rs = sum(1 for d in chunk_dates if locked_board.get((emp_id, d)) == 'R')
+                if locked_Rs > 1:
+                    diagnostics.append(f"[{chunk_dates[0]} 至 {chunk_dates[-1]}] {eid} 該區間被鎖定了 {locked_Rs} 天例假(R)，違反「每區間僅能1例」規定。")
+                
+                # 計算引擎在這區塊「被迫」一定要排幾個 R
+                if len(chunk_dates) == 7:
+                    required_Rs += 1
 
             # 檢核 5：QSpinBox 總配額不足以應付法律底線
             q = leave_quotas.get(eid, {})
@@ -117,7 +109,7 @@ class ScheduleEngine:
             user_R_quota = r1 + r2
             
             if user_R_quota < required_Rs:
-                diagnostics.append(f"[配額死結] {eid} 依法必須排 {required_Rs} 天例假(R)。但系統讀到的設定配額僅 {user_R_quota} 天 (期內讀到 {r1} 天，跨出讀到 {r2} 天)。請確認 QSpinBox 總和。")
+                diagnostics.append(f"[配額死結] {eid} 依 7 天區塊劃分，必須排 {required_Rs} 天例假(R)。但系統讀到的設定配額僅 {user_R_quota} 天。請確認 QSpinBox 總和。")
 
         # 回傳去重複的錯誤清單
         return list(set(diagnostics))
@@ -188,7 +180,8 @@ class ScheduleEngine:
                         model.Add(works[(emp_id, date, record['shift_code'])] == 1)
                     else:
                         model.Add(works[(emp_id, date, 'Train')] == 0)
-                        model.Add(works[(emp_id, date, '日')] == 0)
+                        # 💡 [解鎖] 將 '日' 班開放，作為吸收過剩人力的「溢流待命椅」
+                        # model.Add(works[(emp_id, date, '日')] == 0)
                         model.Add(works[(emp_id, date, '01早')] == 0)
                         model.Add(works[(emp_id, date, '01午')] == 0)
                         model.Add(works[(emp_id, date, '01夜')] == 0)
@@ -358,26 +351,13 @@ class ScheduleEngine:
                     model.Add(mid_a_count <= 1)
 
             # =========================================================================
-            # 🛡️ 連班與例假防線 (取代原有的單純 is_working 判斷)
+            # 🛡️ 連班與例假防線
             # =========================================================================
-            # 準備「週日到週六」的日期分組字典，用來限制例假 (R)
-            # 💡 [修改] 如果是 Debug 模式，直接跳過所有的七休一、每週一例與四連休防線
-            if not debug_mode:
-
-                weeks_dict = {}
-                for d_str in all_eval_dates:
-                    d_obj = datetime.strptime(d_str, '%Y-%m-%d')
-                    # weekday(): 0 是週一, 6 是週日。計算距離本週日的差值以求出週日日期
-                    days_since_sun = (d_obj.weekday() + 1) % 7 
-                    sun_date = d_obj - timedelta(days=days_since_sun)
-                    sun_str = sun_date.strftime('%Y-%m-%d')
-                    if sun_str not in weeks_dict:
-                        weeks_dict[sun_str] = []
-                    weeks_dict[sun_str].append(d_str)
-
+            # 💡 [修改] 廢棄容易產生歷史邊界漏洞的自然週，改用使用者定義的絕對 7 天區塊
+            
             for emp_id in emp_ids:
                 # 條件 1：任何連續 7 天內，(上班 + P + L) 最多只能 6 天
-                # (等同於強迫任何滾動 7 天區間，至少要有一天的 r 或是 R)
+                # (這條防線負責確保「絕對不會出現連續上 7 天班」的狀況，不受區塊切分影響)
                 for i in range(len(all_eval_dates) - 6):
                     window_wpl = []
                     for j in range(7):
@@ -391,21 +371,17 @@ class ScheduleEngine:
                             window_wpl.append(val)
                     model.Add(sum(window_wpl) <= 6)
                 
-                # 條件 2：每個「週日到週六」的區間內，一定要出現至少一個 'R'
-                for sun_str, week_dates in weeks_dict.items():
-                    # 防呆保護：只約束「完整 7 天都落在資料範圍內」且「包含未來需排班日期」的週
-                    # 避免因為月初/月底的殘缺週，強迫壓縮排 R 導致引擎無解
-                    if len(week_dates) == 7 and any(d >= eval_dates[0] for d in week_dates):
-                        window_R = []
-                        for d in week_dates:
-                            if d < eval_dates[0]:
-                                shift = dict_history.get((emp_id, d))
-                                val = 1 if shift == 'R' else 0
-                                window_R.append(val)
-                            else:
-                                window_R.append(works[(emp_id, d, 'R')])
-                        model.Add(sum(window_R) == 1)
-
+                # 👇 💡 [修正] 條件 2：從排班第一天起，每 7 天一個絕對區間，每個區間只能有 1 個 R
+                if not debug_mode:
+                    for i in range(0, len(eval_dates), 7):
+                        chunk_dates = eval_dates[i:i+7]
+                        window_R = [works[(emp_id, d, 'R')] for d in chunk_dates]
+                        
+                        if len(chunk_dates) == 7:
+                            model.Add(sum(window_R) == 1) # 完整七天強制 1 個 R
+                        else:
+                            model.Add(sum(window_R) <= 1) # 殘缺的尾段天數最多 1 個 R
+            
                 # 💡 [修改] 加入控制台判斷
                 if rule_config.get('hard_no_4_off', True):            
                     # 👇 💡 [新增] 條件 3：拒絕引擎連續四天休假 (預排圖釘四天以上除外)
@@ -468,6 +444,7 @@ class ScheduleEngine:
             WEIGHT_C_SHIFT_BALANCE = 5 if rule_config.get('soft_bal_c', True) else 0        # 💡 [新增] Normal 員工 C 班平分的扣分權重
  
             WEIGHT_A_SHIFT_BALANCE = 5 if rule_config.get('soft_bal_a', True) else 0    # 💡 [新增] 中A班平分的扣分權重
+            WEIGHT_SUPPORT_BALANCE = 5 if rule_config.get('soft_bal_support', True) else 0 # 💡 [新增] 支援班平分權重
            
             WEIGHT_A_SHIFT_MAX_1 = 50     # 💡 [新增] 中A班超過1天的極重度防線權重
             WEIGHT_M_SHIFT_BONUS = 1      # 💡 [新增] m 班別優先權重 (+1分)
@@ -486,6 +463,7 @@ class ScheduleEngine:
             c_shift_balance_penalty = []  # 💡 [新增] 存放 C 班平分違規的扣分陣列
             a_shift_balance_penalty = []  # 💡 [新增] 存放中A班平分違規的扣分陣列
             a_shift_max_penalty = []      # 💡 [新增] 存放中A班超過1天的扣分陣列
+            support_balance_penalty = []  # 💡 [新增] 存放支援班平分違規的扣分陣列
 
             # 💡 [修改] 補上 c 班別，讓引擎精準計算早班與午班的總人力
             early_shifts_list = ['01早B1', '01早B1c', '01早B2', '01早B2c', '01早m'] 
@@ -635,7 +613,53 @@ class ScheduleEngine:
                     model.AddAbsEquality(abs_diff_c_var, diff_c_var)
                     
                     c_shift_balance_penalty.append(abs_diff_c_var)
-            
+
+            # =========================================================================
+            # ⚖️ 全體員工 待命支援班 (日) 天數平分軟限制 + 負債制
+            # =========================================================================
+            applied_support_debts = getattr(self, 'applied_support_debts', {}) 
+
+            # 篩選名單：所有人 (不分職級)，排除純夜班
+            support_ids = [
+                emp_id for emp_id in emp_ids 
+                if shift_prefs.get(str(emp_id).strip(), 'MIX') != 'NIGHT_ONLY'
+            ]
+
+            if len(support_ids) > 1:
+                support_shifts_list = ['日']
+                emp_support_counts_vars = []
+
+                for emp_id in support_ids:
+                    eid_str = str(emp_id).strip()
+                    
+                    actual_support_count_expr = sum(
+                        works[(emp_id, d, s)] 
+                        for d in eval_dates 
+                        for s in support_shifts_list 
+                        if (emp_id, d, s) in works
+                    )
+                    
+                    applied_val_sup = applied_support_debts.get(eid_str, 0)
+                    
+                    eff_sup_count_var = model.NewIntVar(-999, 999, f'eff_sup_{emp_id}')
+                    model.Add(eff_sup_count_var == actual_support_count_expr - applied_val_sup)
+                    emp_support_counts_vars.append(eff_sup_count_var)
+
+                total_eff_sup = model.NewIntVar(-9999, 9999, 'total_eff_sup')
+                model.Add(total_eff_sup == sum(emp_support_counts_vars))
+                
+                avg_eff_sup = model.NewIntVar(-999, 999, 'avg_eff_sup')
+                model.AddDivisionEquality(avg_eff_sup, total_eff_sup, len(support_ids))
+
+                for emp_id, eff_var in zip(support_ids, emp_support_counts_vars):
+                    diff_sup_var = model.NewIntVar(-999, 999, f'diff_sup_{emp_id}')
+                    model.Add(diff_sup_var == eff_var - avg_eff_sup)
+                    
+                    abs_diff_sup_var = model.NewIntVar(0, 999, f'abs_diff_sup_{emp_id}')
+                    model.AddAbsEquality(abs_diff_sup_var, diff_sup_var)
+                    
+                    support_balance_penalty.append(abs_diff_sup_var)
+
             # =========================================================================
             # ⚖️ Normal 員工 中A 班：(1) 天數平分 + 負債制 (2) 至多一天限制
             # =========================================================================
@@ -745,7 +769,7 @@ class ScheduleEngine:
                 s_pref = shift_prefs.get(str(emp_id).strip(), 'MIX')
                 b_pref = block_prefs.get(str(emp_id).strip(), 'ANY')
                 n_seg_pref = night_seg_prefs.get(str(emp_id).strip(), 'ANY') # 💡 取得夜班段數意願
-                is_m_level = job_levels.get(str(emp_id).strip(), 'Normal') in ('M', 't')
+                is_m_level = job_levels.get(str(emp_id).strip(), 'Normal') in ('M', 'Chief', 't')
                 is_t_level = job_levels.get(str(emp_id).strip(), 'Normal') == 't'
                 # 🤡 [新增] 職級 M 的專屬軟限制
 
@@ -961,6 +985,7 @@ class ScheduleEngine:
                     - WEIGHT_M_DAY_BALANCE * sum(m_day_balance_penalty)  # 💡 [新增] 扣除 M/m 班分佈不均的違規分數
                     - WEIGHT_C_SHIFT_BALANCE * sum(c_shift_balance_penalty)  # 💡 [新增] 扣除 C 班分佈不均的違規分數
                     - WEIGHT_A_SHIFT_BALANCE * sum(a_shift_balance_penalty)  # 💡 [新增] 扣除 中A 班分佈不均的違規分數
+                    - WEIGHT_SUPPORT_BALANCE * sum(support_balance_penalty)  # 💡 [新增] 扣除支援班分配不均
                     - WEIGHT_A_SHIFT_MAX_1 * sum(a_shift_max_penalty)        # 💡 [新增] 扣除 中A 班超過1天的極重度懲罰
                     + WEIGHT_M_SHIFT_BONUS * sum(m_shift_bonus_score) 
                     - sum(virtual_penalties)

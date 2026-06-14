@@ -568,41 +568,56 @@ class SchedulerDialog(QDialog):
             QMessageBox.warning(self, "排班失敗", message)
 
     def on_debug_run_clicked(self):
+        """執行暴力 Debug 排班前，先彈出分級人力診斷報告"""
         start_date, end_date = self.get_selected_dates()
         dates = pd.date_range(start=start_date, end=end_date).tolist()
         num_days = len(dates)
 
-        # 1. 取得當前區間上下限參數
-        from config.settings import SHIFT_DEMANDS
-        daily_min = sum(req[0] for req in SHIFT_DEMANDS.values())
-        daily_max = sum(req[1] for req in SHIFT_DEMANDS.values())
-        cycle_min_demand = daily_min * num_days
-        cycle_max_demand = daily_max * num_days
+        # 1. 取得主管與基層的每日班別上下限需求
+        from config.settings import SHIFT_DEMANDS, MANAGER_ONLY_SHIFTS
+        
+        daily_min_m = sum(req[0] for s, req in SHIFT_DEMANDS.items() if s in MANAGER_ONLY_SHIFTS)
+        daily_max_m = sum(req[1] for s, req in SHIFT_DEMANDS.items() if s in MANAGER_ONLY_SHIFTS)
+        daily_min_n = sum(req[0] for s, req in SHIFT_DEMANDS.items() if s not in MANAGER_ONLY_SHIFTS)
+        daily_max_n = sum(req[1] for s, req in SHIFT_DEMANDS.items() if s not in MANAGER_ONLY_SHIFTS)
+        
+        cycle_min_m = daily_min_m * num_days
+        cycle_max_m = daily_max_m * num_days
+        cycle_min_n = daily_min_n * num_days
+        cycle_max_n = daily_max_n * num_days
 
-        # 2. 取得可用總人力基數
+        # 2. 依照職級篩選啟用人員
         active_employees = self.db.get_all_active_employees()
-        num_employees = len(active_employees)
-        total_theoretical_slots = num_employees * num_days
+        managers = [e for e in active_employees if str(e.get('job_level', 'Normal')).strip() in ('M', 'Chief', 't')]
+        normals = [e for e in active_employees if str(e.get('job_level', 'Normal')).strip() not in ('M', 'Chief', 't')]
+        
+        num_m = len(managers)
+        num_n = len(normals)
+        
+        slots_m = num_m * num_days
+        slots_n = num_n * num_days
 
-        # 3. 從畫面的 SpinBox 收集休假與加班資料，並計算「只休假」的天數
-        total_off_days = 0
+        # 3. 從畫面的 SpinBox 收集休假與加班資料
+        total_off_m = 0
+        total_off_n = 0
         leave_quotas = {}
         
-        # 定義哪些狀態是純休假 (不包含 O 加班)
         off_keys_left = ['L', 'P', 'r', 'R']
         off_keys_right = ['L2', 'P2', 'r2', 'R2']
         all_off_keys = off_keys_left
         if getattr(self, 'split_date', None):
-            all_off_keys += off_keys_right
+            all_off_keys = off_keys_left + off_keys_right
 
-        # 必須抓取所有的 keys (包含 O) 送給引擎
-        # 💡 [修正] 使用 list() 強制複製陣列，避免污染原生的 self.control_keys_left
         all_keys = list(getattr(self, 'control_keys_left', ['L', 'P', 'r', 'R', 'O']))
         if getattr(self, 'split_date', None):
             all_keys.extend(getattr(self, 'control_keys_right', ['L2', 'P2', 'r2', 'R2', 'O2']))
 
+        manager_ids = [str(e['emp_id']).strip() for e in managers]
+
         for emp_id, widgets in self.leave_widgets.items():
-            leave_quotas[emp_id] = {}
+            eid_str = str(emp_id).strip()
+            leave_quotas[eid_str] = {}
+            emp_off_days = 0
             for k in all_keys:
                 w = widgets.get(k)
                 val = 0
@@ -614,46 +629,54 @@ class SchedulerDialog(QDialog):
                             val = int(w.text())
                         except (ValueError, TypeError):
                             val = 0
-                leave_quotas[emp_id][k] = val
+                leave_quotas[eid_str][k] = val
                 
-                # 如果這個 key 是休假，就計入總休假天數
                 if k in all_off_keys:
-                    total_off_days += val
+                    emp_off_days += val
+            
+            if eid_str in manager_ids:
+                total_off_m += emp_off_days
+            else:
+                total_off_n += emp_off_days
 
-        # 4. 計算最終實質可用人力數 = (總員工 * 總天數) - 總休假數
-        available_manpower = total_theoretical_slots - total_off_days
+        avail_m = slots_m - total_off_m
+        avail_n = slots_n - total_off_n
 
-        # 5. 組合分析報告並彈出診斷視窗
-        msg = (f"📊 【排班數據物理診斷】\n\n"
+        # 5. 組合分級分析報告與確認視窗
+        msg = (f"📊 【分級人力配額物理試算】\n\n"
                f"📅 區間：{start_date} 至 {end_date} (共 {num_days} 天)\n"
-               f"👥 啟用人數：{num_employees} 人\n"
-               f"🛏️ QSpinBox休假總數：{total_off_days} 天\n"
                f"----------------------------------------\n"
-               f"🎯 本週期總需求下限：{cycle_min_demand} 人次\n"
-               f"🎯 本週期總需求上限：{cycle_max_demand} 人次\n"
-               f"💪 實際可用總人力：{available_manpower} 人次\n\n")
-
-        # 附上智慧提示
-        if available_manpower < cycle_min_demand:
-            msg += "⚠️ 警告：可用人力低於最低需求下限！\n(引擎必定無法排出完整班表，將動用百萬罰分虛擬人力)\n"
-        elif available_manpower > cycle_max_demand:
-            msg += "⚠️ 警告：可用人力高於最高需求上限！\n(代表這週期有人一定排不滿，被迫休無薪假或變成待命狀態)\n"
+               f"👑 主管級人員 (M/Chief/t)：{num_m} 人\n"
+               f"🛏️ 主管總休假數：{total_off_m} 天\n"
+               f"🎯 主管總需求下限：{cycle_min_m} 人次 | 上限：{cycle_max_m} 人次\n"
+               f"💪 主管實際可用人力：{avail_m} 人次\n")
+        
+        if avail_m < cycle_min_m or avail_m > cycle_max_m:
+            msg += "⚠️ 警告：主管總量超出物理班表邊界！\n"
         else:
-            msg += "✅ 評估：人力落在安全容許區間內。\n"
+            msg += "✅ 評估：主管級總量正常。\n"
 
-        # 💡 [修改] 更改彈出視窗的說明文字
+        msg += (f"\n👥 基層人員 (Normal)：{num_n} 人\n"
+               f"🛏️ 基層總休假數：{total_off_n} 天\n"
+               f"🎯 基層總需求下限：{cycle_min_n} 人次 | 上限：{cycle_max_n} 人次\n"
+               f"💪 基層實際可用人力：{avail_n} 人次\n")
+        
+        if avail_n < cycle_min_n or avail_n > cycle_max_n:
+            msg += "⚠️ 警告：基層總量超出物理班表邊界！\n"
+        else:
+            msg += "✅ 評估：基層級總量正常。\n"
+
+        msg += "\n----------------------------------------\n"
         msg += "\n是否確認執行【終極暴力 Debug】？\n(⚠️ 警告：此模式將徹底無視七休一、交接班相剋等所有勞基法規則，僅為測試「人數物理極限」而存在！)"
 
         reply = QMessageBox.question(self, "暴力 Debug (無視法規)", msg, QMessageBox.Yes | QMessageBox.No)
         
         if reply == QMessageBox.Yes:
+            from engine.solver import ScheduleEngine
             engine = ScheduleEngine(self.db)
             try:
-                # 💡 傳遞 debug_mode=True 標記給引擎，且為了保險起見傳入空 rule_config
-                success, message = engine.run_scheduler(start_date, end_date, leave_quotas, split_date=getattr(self, 'split_date', None), debug_mode=True, rule_config={})
+                success, message = engine.run_scheduler(start_date, end_date, leave_quotas, split_date=getattr(self, 'split_date', None), debug_mode=True, rule_config={'strict_quotas': False, 'hard_mid_a': False, 'hard_no_4_off': False})
             except TypeError:
-                # 容錯處理：如果 solver.py 尚未實作接受 debug_mode 參數，就先呼叫原本的引擎
-                QMessageBox.warning(self, "系統提示", "引擎端 (solver.py) 尚未開啟 debug_mode 支援，本次將以正常智能排班執行。")
                 success, message = engine.run_scheduler(start_date, end_date, leave_quotas, split_date=getattr(self, 'split_date', None))
 
             if success:
@@ -663,42 +686,63 @@ class SchedulerDialog(QDialog):
                 QMessageBox.warning(self, "排班失敗", message)
 
     def on_check_manpower_clicked(self):
-        """僅顯示當前 QSpinBox 休假與人力統計資訊，不執行排班"""
+        """僅顯示當前 QSpinBox 休假與人力統計資訊，並預檢硬規則衝突，不執行排班"""
         start_date, end_date = self.get_selected_dates()
         dates = pd.date_range(start=start_date, end=end_date).tolist()
         num_days = len(dates)
+        eval_dates = [d.strftime('%Y-%m-%d') for d in dates]
 
-        # 1. 取得當前區間上下限參數
-        from config.settings import SHIFT_DEMANDS
-        daily_min = sum(req[0] for req in SHIFT_DEMANDS.values())
-        daily_max = sum(req[1] for req in SHIFT_DEMANDS.values())
-        cycle_min_demand = daily_min * num_days
-        cycle_max_demand = daily_max * num_days
+        # 1. 取得主管與基層的每日班別上下限需求
+        from config.settings import SHIFT_DEMANDS, MANAGER_ONLY_SHIFTS
+        
+        daily_min_m = sum(req[0] for s, req in SHIFT_DEMANDS.items() if s in MANAGER_ONLY_SHIFTS)
+        daily_max_m = sum(req[1] for s, req in SHIFT_DEMANDS.items() if s in MANAGER_ONLY_SHIFTS)
+        daily_min_n = sum(req[0] for s, req in SHIFT_DEMANDS.items() if s not in MANAGER_ONLY_SHIFTS)
+        daily_max_n = sum(req[1] for s, req in SHIFT_DEMANDS.items() if s not in MANAGER_ONLY_SHIFTS)
+        
+        cycle_min_m = daily_min_m * num_days
+        cycle_max_m = daily_max_m * num_days
+        cycle_min_n = daily_min_n * num_days
+        cycle_max_n = daily_max_n * num_days
 
-        # 2. 取得可用總人力基數
+        # 2. 依照職級篩選啟用人員 (M, Chief, t 納入主管戰力群)
         active_employees = self.db.get_all_active_employees()
-        num_employees = len(active_employees)
-        total_theoretical_slots = num_employees * num_days
+        managers = [e for e in active_employees if str(e.get('job_level', 'Normal')).strip() in ('M', 'Chief', 't')]
+        normals = [e for e in active_employees if str(e.get('job_level', 'Normal')).strip() not in ('M', 'Chief', 't')]
+        
+        num_m = len(managers)
+        num_n = len(normals)
+        
+        slots_m = num_m * num_days
+        slots_n = num_n * num_days
 
-        # 3. 從畫面的 SpinBox 收集休假與加班資料
-        total_off_days = 0
+        # 3. 從畫面的 SpinBox 收集分級休假資料
+        total_off_m = 0
+        total_off_n = 0
+        leave_quotas = {}
         
         # 定義哪些狀態是純休假 (不包含 O 加班)
         off_keys_left = ['L', 'P', 'r', 'R']
         off_keys_right = ['L2', 'P2', 'r2', 'R2']
         all_off_keys = off_keys_left
         if getattr(self, 'split_date', None):
-            all_off_keys += off_keys_right
+            all_off_keys = off_keys_left + off_keys_right
 
-        # 💡 [防護] 使用 list() 強制複製陣列，避免污染原生的 self.control_keys_left
+        # 使用 list() 強制複製陣列，避免污染原生控制設定
         all_keys = list(getattr(self, 'control_keys_left', ['L', 'P', 'r', 'R', 'O']))
         if getattr(self, 'split_date', None):
             all_keys.extend(getattr(self, 'control_keys_right', ['L2', 'P2', 'r2', 'R2', 'O2']))
 
+        manager_ids = [str(e['emp_id']).strip() for e in managers]
+
         for emp_id, widgets in self.leave_widgets.items():
+            eid_str = str(emp_id).strip()
+            leave_quotas[eid_str] = {}
+            emp_off_days = 0
             for k in all_keys:
                 w = widgets.get(k)
-                if w is not None and k in all_off_keys:
+                val = 0
+                if w is not None:
                     try:
                         val = w.value() 
                     except AttributeError:
@@ -706,31 +750,84 @@ class SchedulerDialog(QDialog):
                             val = int(w.text())
                         except (ValueError, TypeError):
                             val = 0
-                    total_off_days += val
+                leave_quotas[eid_str][k] = val
+                
+                if k in all_off_keys:
+                    emp_off_days += val
+            
+            # 分流加總休假天數
+            if eid_str in manager_ids:
+                total_off_m += emp_off_days
+            else:
+                total_off_n += emp_off_days
 
-        # 4. 計算最終實質可用人力數 = (總員工 * 總天數) - 總休假數
-        available_manpower = total_theoretical_slots - total_off_days
+        # 計算各級別實質可用人力
+        avail_m = slots_m - total_off_m
+        avail_n = slots_n - total_off_n
 
-        # 5. 組合分析報告並彈出診斷視窗
-        msg = (f"📊 【人力配額物理試算】\n\n"
+        # 4. 跨境調用引擎的硬規則安檢探針
+        from engine.solver import ScheduleEngine
+        emp_ids = [e['emp_id'] for e in active_employees]
+        job_levels = {str(e['emp_id']).strip(): str(e['job_level']).strip() for e in active_employees}
+        shift_prefs = {str(e['emp_id']).strip(): str(e.get('shift_pref', 'MIX')).strip() for e in active_employees}
+        
+        schedules = self.db.get_schedule_by_date_range(eval_dates[0], eval_dates[-1])
+        dict_sched = {(s['emp_id'], s['date']): s for s in schedules}
+
+        from datetime import datetime, timedelta
+        eval_start_dt = datetime.strptime(eval_dates[0], '%Y-%m-%d')
+        history_start = (eval_start_dt - timedelta(days=7)).strftime('%Y-%m-%d')
+        history_end = (eval_start_dt - timedelta(days=1)).strftime('%Y-%m-%d')
+        history_schedules = self.db.get_schedule_by_date_range(history_start, history_end)
+        dict_history = {(s['emp_id'], s['date']): s['shift_code'] for s in history_schedules}
+        
+        engine = ScheduleEngine(self.db)
+        hard_conflicts = engine._run_pre_flight_diagnostics(
+            emp_ids, eval_dates, dict_sched, dict_history, job_levels, shift_prefs, leave_quotas
+        )
+
+        # 5. 組合分級分析報告
+        msg = (f"📊 【分級人力配額物理試算】\n\n"
                f"📅 區間：{start_date} 至 {end_date} (共 {num_days} 天)\n"
-               f"👥 啟用人數：{num_employees} 人\n"
-               f"🛏️ QSpinBox休假總數：{total_off_days} 天\n"
                f"----------------------------------------\n"
-               f"🎯 本週期總需求下限：{cycle_min_demand} 人次\n"
-               f"🎯 本週期總需求上限：{cycle_max_demand} 人次\n"
-               f"💪 實際可用總人力：{available_manpower} 人次\n\n")
-
-        # 附上智慧提示
-        if available_manpower < cycle_min_demand:
-            msg += "⚠️ 警告：可用人力低於最低需求下限！\n(此配額若送出排班，必定會動用百萬罰分虛擬人力)\n"
-        elif available_manpower > cycle_max_demand:
-            msg += "⚠️ 警告：可用人力高於最高需求上限！\n(代表這週期有人一定排不滿，被迫休無薪假或待命)\n"
+               f"👑 主管級人員 (M/Chief/t)：{num_m} 人\n"
+               f"🛏️ 主管總休假數：{total_off_m} 天\n"
+               f"🎯 主管總需求下限：{cycle_min_m} 人次 | 上限：{cycle_max_m} 人次\n"
+               f"💪 主管實際可用人力：{avail_m} 人次\n")
+        
+        if avail_m < cycle_min_m:
+            msg += "⚠️ 警告：主管可用人力低於專屬班別需求底線！\n"
+        elif avail_m > cycle_max_m:
+            msg += "⚠️ 警告：主管總可用人力超出專屬班別上限！\n"
         else:
-            msg += "✅ 評估：人力落在安全容許區間內。\n"
+            msg += "✅ 評估：主管級總量正常。\n"
 
-        # 僅顯示 Information，沒有 Yes/No 的確認動作，不觸發引擎
-        QMessageBox.information(self, "人力試算 (不排班)", msg)
+        msg += (f"\n👥 基層人員 (Normal)：{num_n} 人\n"
+               f"🛏️ 基層總休假數：{total_off_n} 天\n"
+               f"🎯 基層總需求下限：{cycle_min_n} 人次 | 上限：{cycle_max_n} 人次\n"
+               f"💪 基層實際可用人力：{avail_n} 人次\n")
+        
+        if avail_n < cycle_min_n:
+            msg += "⚠️ 警告：基層可用人力低於底線需求！\n"
+        elif avail_n > cycle_max_n:
+            msg += "⚠️ 警告：基層可工作天數超出全體基層班別最大容量！\n"
+        else:
+            msg += "✅ 評估：基層級總量正常。\n"
+
+        msg += "\n----------------------------------------\n"
+        msg += "🚨 【預排班表與配額死結預檢】\n"
+        if not hard_conflicts:
+            msg += "✅ 檢查通過：當前預排圖釘與特休配額無硬性法規死結。\n"
+        else:
+            msg += f"❌ 偵測到 {len(hard_conflicts)} 項硬規則死結 (會引發0.5秒崩潰)：\n\n"
+            for err in hard_conflicts[:5]:
+                msg += f"  👉 {err}\n"
+            if len(hard_conflicts) > 5:
+                msg += f"  ...等共 {len(hard_conflicts)} 項衝突。\n"
+            msg += "\n💡 提示：請先至主面板解除圖釘鎖定或調整 QSpinBox 例假天數！"
+
+        QMessageBox.information(self, "分級人力與死結綜合試算 (不排班)", msg)
+
 
     # 🔧 [功能二] 實作安全刪除邏輯
     def on_clear_schedule_clicked(self):
