@@ -82,7 +82,7 @@ class RunConfigDialog(QDialog):
         
         layout_soft.addSpacing(15)
         self.cb_bal_early_noon = self._create_checkbox("平分：每日早/午班人數均衡", True)
-        self.cb_bal_night = self._create_checkbox("平分：主管夜班天數平均 + 負債制", True)
+        #self.cb_bal_night = self._create_checkbox("平分：主管夜班天數平均 + 負債制", True)
         self.cb_bal_m_day = self._create_checkbox("平分：早M/午M天數平均 + 負債制", True)
         self.cb_bal_c = self._create_checkbox("平分：基層 C 班天數平均 + 負債制", True)
         self.cb_bal_a = self._create_checkbox("平分：中A班天數平均 + 負債制", True)
@@ -93,7 +93,7 @@ class RunConfigDialog(QDialog):
         layout_soft.addWidget(self.cb_loc_mix)
         layout_soft.addWidget(self.cb_night_seg)
         layout_soft.addWidget(self.cb_bal_early_noon)
-        layout_soft.addWidget(self.cb_bal_night)
+        #layout_soft.addWidget(self.cb_bal_night)
         layout_soft.addWidget(self.cb_bal_m_day)
         layout_soft.addWidget(self.cb_bal_c)
         layout_soft.addWidget(self.cb_bal_a)
@@ -142,7 +142,7 @@ class RunConfigDialog(QDialog):
         self.cb_loc_mix.setChecked(state)
         self.cb_night_seg.setChecked(state)
         self.cb_bal_early_noon.setChecked(state)
-        self.cb_bal_night.setChecked(state)
+        #self.cb_bal_night.setChecked(state)
         self.cb_bal_m_day.setChecked(state)
         self.cb_bal_c.setChecked(state)
         self.cb_bal_a.setChecked(state)
@@ -161,7 +161,7 @@ class RunConfigDialog(QDialog):
             'soft_night_seg': self.cb_night_seg.isChecked(),
             
             'soft_bal_early_noon': self.cb_bal_early_noon.isChecked(),
-            'soft_bal_night': self.cb_bal_night.isChecked(),
+            #self.cb_bal_night.isChecked(),
             'soft_bal_m_day': self.cb_bal_m_day.isChecked(),
             'soft_bal_c': self.cb_bal_c.isChecked(),
             'soft_bal_a': self.cb_bal_a.isChecked(),
