@@ -37,15 +37,16 @@ class RunConfigDialog(QDialog):
         
         
         # 強制鎖定不可取消的項目
-        self.cb_law_7_in_1 = self._create_checkbox("七休一 (連續7天必有1休)", True, disabled=True)
-        self.cb_law_r = self._create_checkbox("每週一例 (週日至六必有1R)", True, disabled=True)
-        self.cb_clash = self._create_checkbox("交接班相剋 (如午不接早)", True, disabled=True)
-        self.cb_demands = self._create_checkbox("滿足每日班別人數上下限", True, disabled=True)
+        self.cb_law_7_in_1 = self._create_checkbox("七休一 (連續7天必有1休)", True)
+        self.cb_law_r = self._create_checkbox("每週一例 (週日至六必有1R)", True)
+        self.cb_clash = self._create_checkbox("交接班相剋 (如午不接早)", True)
+        self.cb_demands = self._create_checkbox("滿足每日班別人數上下限", True)
         
         # 可自由切換的專案硬限制
         self.cb_strict_quotas = self._create_checkbox("嚴格遵守 QSpinBox 休假配額", True)
         self.cb_mid_a = self._create_checkbox("中A班單日不得超過 1 人", True)
         self.cb_no_4_off = self._create_checkbox("引擎禁止主動排連續 4 天休假", True)
+        self.cb_night_2_off = self._create_checkbox("夜班下莊後強制連休 2 天", True) # 新增此行
         
         layout_hard.addWidget(self.cb_law_7_in_1)
         layout_hard.addWidget(self.cb_law_r)
@@ -56,6 +57,7 @@ class RunConfigDialog(QDialog):
         layout_hard.addWidget(self.cb_mid_a)
         layout_hard.addWidget(self.cb_no_4_off)
         layout_hard.addStretch()
+        layout_hard.addWidget(self.cb_night_2_off) # 新增此行將元件放入排版
         group_hard.setLayout(layout_hard)
         
         # ==========================================
@@ -131,9 +133,14 @@ class RunConfigDialog(QDialog):
     
     # 💡 [新增] 硬規則切換邏輯 (避開勞基法鎖定項目)
     def toggle_hard_rules(self, state):
+        self.cb_law_7_in_1.setChecked(state)
+        self.cb_law_r.setChecked(state)
+        self.cb_clash.setChecked(state)
+        self.cb_demands.setChecked(state)
         self.cb_strict_quotas.setChecked(state)
         self.cb_mid_a.setChecked(state)
         self.cb_no_4_off.setChecked(state)
+        self.cb_night_2_off.setChecked(state)
 
     # 💡 [新增] 軟規則切換邏輯
     def toggle_soft_rules(self, state):
@@ -151,9 +158,15 @@ class RunConfigDialog(QDialog):
     def get_config(self):
         """將 UI 的勾選狀態打包成 Dictionary 供引擎讀取"""
         return {
+            'hard_law_7_in_1': self.cb_law_7_in_1.isChecked(),
+            'hard_law_r': self.cb_law_r.isChecked(),
+            'hard_clash': self.cb_clash.isChecked(),
+            'hard_demands': self.cb_demands.isChecked(),
+            
             'strict_quotas': self.cb_strict_quotas.isChecked(),
             'hard_mid_a': self.cb_mid_a.isChecked(),
             'hard_no_4_off': self.cb_no_4_off.isChecked(),
+            'hard_night_2_off': self.cb_night_2_off.isChecked(), # 新增此行
             
             'soft_shift_pref': self.cb_shift_pref.isChecked(),
             'soft_block_pref': self.cb_block_pref.isChecked(),

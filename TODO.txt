@@ -29,11 +29,13 @@ Ongoing
 
 5.做一個檢查視窗=該區間內M(M,m,夜),normal(主結,中A)是否平均
 
-6.job_level="m,chief" 除了s_pref !=night_only，01M和01m做一個平均的權重(每個人的M班和m班盡量一樣)，然後加入之前討論過的負債制
+6.預劃前不要夜班
 
 
 Bug fixing
 1.週日紅字不見
+2.一周內無法自動分配R 1周2 一周0 (假期自動分配？)Rr分配不均
+
 
 
 not necessary enhance

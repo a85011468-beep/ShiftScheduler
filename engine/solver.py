@@ -11,6 +11,14 @@ from config.settings import (ALL_STATES, WORK_SHIFTS, OFF_SHIFTS, SHIFT_DEMANDS,
 class ScheduleEngine:
     def __init__(self, db_manager):
         self.db = db_manager
+        self.current_solver = None # 用於綁定目前的求解器
+        self.is_cancelled = False  # 中斷訊號標記
+
+    def cancel(self):
+        """觸發中斷訊號，立刻停止 C++ 底層運算"""
+        self.is_cancelled = True
+        if self.current_solver:
+            self.current_solver.StopSearch()
 
     def _ensure_blank_grid(self, employees, dates):
         conn = self.db.get_connection()
@@ -23,7 +31,7 @@ class ScheduleEngine:
         conn.commit()
         conn.close()
 
-    def _run_pre_flight_diagnostics(self, emp_ids, eval_dates, dict_sched, dict_history, job_levels, shift_prefs, leave_quotas, split_date=None):
+    def _run_pre_flight_diagnostics(self, emp_ids, eval_dates, dict_sched, dict_history, job_levels, shift_prefs, leave_quotas,night_dates, dict_sched_overall, split_date=None):
         diagnostics = []
         
         # 1. 建立全局鎖定看板 (合併歷史紀錄與未來的圖釘)
@@ -103,17 +111,17 @@ class ScheduleEngine:
                     required_Rs += 1
 
             # 檢核 5：QSpinBox 總配額不足以應付法律底線
-            q = leave_quotas.get(eid, {})
-            r1 = int(q.get('R', 0))
-            r2 = int(q.get('R2', 0))
-            user_R_quota = r1 + r2
+            #q = leave_quotas.get(eid, {})
+            #r1 = int(q.get('R', 0))
+            #r2 = int(q.get('R2', 0))
+            #user_R_quota = r1 + r2
             
-            if user_R_quota < required_Rs:
-                diagnostics.append(f"[配額死結] {eid} 依 7 天區塊劃分，必須排 {required_Rs} 天例假(R)。但系統讀到的設定配額僅 {user_R_quota} 天。請確認 QSpinBox 總和。")
+            #if user_R_quota < required_Rs:
+            #    diagnostics.append(f"[配額死結] {eid} 依 7 天區塊劃分，必須排 {required_Rs} 天例假(R)。但系統讀到的設定配額僅 {user_R_quota} 天。請確認 QSpinBox 總和。")
         # ==========================================
         # 🛡️ 檢核 6：圖釘數量是否大於 QSpinBox 額度 (回歸單一區間)
         # ==========================================
-        check_shifts = ['L', 'P', 'R', 'r', 'O']
+        check_shifts = ['L', 'P', 'r', 'O']
         for emp_id in emp_ids:
             eid = str(emp_id).strip()
             q = leave_quotas.get(eid, {})
@@ -125,18 +133,31 @@ class ScheduleEngine:
                     diagnostics.append(f"[額度死結] {eid} 期間內被圖釘釘了 {locked_all} 天 {shift}，但 QSpinBox 額度僅給予 {quota_all}。")
 
         # 👇 💡 [新增] 檢核 7：夜班 QSpinBox 總量防呆
+        night_eval_dates = [d for d in eval_dates if d in night_dates]
+        night_outside_dates = [d for d in night_dates if d not in eval_dates]
+        
         total_night_quota = sum(int(leave_quotas.get(str(eid).strip(), {}).get('夜', 0)) for eid in emp_ids)
+        
+        # 計算夜班參照區間內，落在「非運算區」且已經是夜班的人數
+        already_night_total = 0
+        for d in night_outside_dates:
+            for emp_id in emp_ids:
+                record = dict_sched_overall.get((emp_id, d))
+                if record and record['shift_code'] in ('01夜B1', '01夜B2'):
+                    already_night_total += 1
+
         from config.settings import SHIFT_DEMANDS
         req_night_per_day = SHIFT_DEMANDS.get('01夜B1', [0,0])[0] + SHIFT_DEMANDS.get('01夜B2', [0,0])[0]
-        min_night_needed = req_night_per_day * len(eval_dates)
+        # 只算主運算區間且涵蓋在參照區間內的日子需求
+        min_night_needed = req_night_per_day * len(night_eval_dates)
         
-        if total_night_quota < min_night_needed:
-            diagnostics.append(f"[配額死結] 本區間共需 {min_night_needed} 個人次上夜班，但 QSpinBox 總共只發放了 {total_night_quota} 個「夜」。引擎將無人可用！")
-        # 回傳去重複的錯誤清單
+        if total_night_quota - already_night_total < min_night_needed:
+            diagnostics.append(f"[配額死結] 扣除參照區間內已定案之夜班後，剩餘夜班配額 ({total_night_quota - already_night_total}) 不足以填滿運算區間所需夜班數 ({min_night_needed})！")
+
         return list(set(diagnostics))
 
 
-    def run_scheduler(self, start_date, end_date, leave_quotas=None, debug_mode=False, rule_config=None):
+    def run_scheduler(self, start_date, end_date, night_start_date, night_end_date, leave_quotas=None, debug_mode=False, rule_config=None):
         if leave_quotas is None: leave_quotas = {}
         if rule_config is None: rule_config = {}  # 確保預設為空字典防呆
         
@@ -153,10 +174,20 @@ class ScheduleEngine:
     
         target_dates = pd.date_range(start=start_date, end=end_date).strftime('%Y-%m-%d').tolist()
         eval_dates = target_dates 
+        night_dates = pd.date_range(start=night_start_date, end=night_end_date).strftime('%Y-%m-%d').tolist()
+
+        # 求出涵蓋主運算與夜班的整體範圍，以利調閱全域排班
+        overall_start = min(start_date, night_start_date)
+        overall_end = max(end_date, night_end_date) 
         
         self._ensure_blank_grid(employees, eval_dates)
+
         schedules = self.db.get_schedule_by_date_range(eval_dates[0], eval_dates[-1])
         dict_sched = {(s['emp_id'], s['date']): s for s in schedules}
+
+        # 💡 調閱涵蓋兩者的整體班表
+        overall_schedules = self.db.get_schedule_by_date_range(overall_start, overall_end)
+        dict_sched_overall = {(s['emp_id'], s['date']): s for s in overall_schedules}
 
         eval_start_dt = datetime.strptime(eval_dates[0], '%Y-%m-%d')
         history_start = (eval_start_dt - timedelta(days=7)).strftime('%Y-%m-%d')
@@ -168,7 +199,9 @@ class ScheduleEngine:
         # 🚀 啟動硬規則飛行前安檢 (Pre-flight Diagnostics)
         # =========================================================================
         print("🔍 啟動硬規則飛行前安檢...")
-        hard_conflicts = self._run_pre_flight_diagnostics(emp_ids, eval_dates, dict_sched, dict_history, job_levels, shift_prefs, leave_quotas)
+        hard_conflicts = self._run_pre_flight_diagnostics(
+            emp_ids, eval_dates, dict_sched, dict_history, job_levels, shift_prefs, leave_quotas, night_dates, dict_sched_overall
+            )
         
         if hard_conflicts:
             error_msg = "❌ 引擎安檢未通過！偵測到無法解開的「硬規則死結」：\n\n"
@@ -226,31 +259,31 @@ class ScheduleEngine:
                 for shift, (min_req, max_req) in SHIFT_DEMANDS.items():
                     shift_vars = [works[(emp_id, date, shift)] for emp_id in emp_ids]
                     
-                    # 💡 導入虛擬人力：真實人力 + 虛擬人力 >= 最低需求
-                    slack_min = model.NewIntVar(0, min_req, f'slack_min_{date}_{shift}')
-                    model.Add(sum(shift_vars) + slack_min >= min_req)
-                    model.Add(sum(shift_vars) <= max_req)
-                    
-                    virtual_penalties.append(slack_min * 1000000)
-                    virtual_vars_dict[(date, shift)] = slack_min
+                    if rule_config.get('hard_demands', True):
+                        slack_min = model.NewIntVar(0, min_req, f'slack_min_{date}_{shift}')
+                        model.Add(sum(shift_vars) + slack_min >= min_req)
+                        model.Add(sum(shift_vars) <= max_req)
+                        
+                        virtual_penalties.append(slack_min * 1000000)
+                        virtual_vars_dict[(date, shift)] = slack_min
 
-                # 💡 [修改] 加入 01早B2c 戰力
                 early_combo_vars = [works[(emp_id, date, '01早B2')] for emp_id in emp_ids] + \
                                    [works[(emp_id, date, '01早B2c')] for emp_id in emp_ids] + \
                                    [works[(emp_id, date, '01早m')] for emp_id in emp_ids]
-                slack_early = model.NewIntVar(0, 2, f'slack_early_{date}')
-                model.Add(sum(early_combo_vars) + slack_early >= 2)
-                virtual_penalties.append(slack_early * 1000000)
-                virtual_vars_dict[(date, '早班複合戰力')] = slack_early
+                if rule_config.get('hard_demands', True):
+                    slack_early = model.NewIntVar(0, 2, f'slack_early_{date}')
+                    model.Add(sum(early_combo_vars) + slack_early >= 2)
+                    virtual_penalties.append(slack_early * 1000000)
+                    virtual_vars_dict[(date, '早班複合戰力')] = slack_early
 
-                # 💡 [修改] 加入 01午B2c 戰力
                 noon_combo_vars = [works[(emp_id, date, '01午B2')] for emp_id in emp_ids] + \
                                   [works[(emp_id, date, '01午B2c')] for emp_id in emp_ids] + \
                                   [works[(emp_id, date, '01午m')] for emp_id in emp_ids]
-                slack_noon = model.NewIntVar(0, 2, f'slack_noon_{date}')
-                model.Add(sum(noon_combo_vars) + slack_noon >= 2)
-                virtual_penalties.append(slack_noon * 1000000)
-                virtual_vars_dict[(date, '午班複合戰力')] = slack_noon
+                if rule_config.get('hard_demands', True):
+                    slack_noon = model.NewIntVar(0, 2, f'slack_noon_{date}')
+                    model.Add(sum(noon_combo_vars) + slack_noon >= 2)
+                    virtual_penalties.append(slack_noon * 1000000)
+                    virtual_vars_dict[(date, '午班複合戰力')] = slack_noon
 
             # =========================================================================
             # 2.5 🚑 加班 (O) 轉換邏輯：將指定的加班額度強制指派為特定工作班別
@@ -284,16 +317,35 @@ class ScheduleEngine:
             # =========================================================================
             if strict_quotas:
                 for emp_id in emp_ids:
-                    q = leave_quotas.get(str(emp_id).strip(), {})
+                    eid = str(emp_id).strip()
+                    q = leave_quotas.get(eid, {})
                     
                     # 💡 徹底刪除所有 split_date 判斷，回歸最單純的單一區間加總
                     model.Add(sum(works[(emp_id, d, 'L')] for d in eval_dates) == q.get('L', 0))
                     model.Add(sum(works[(emp_id, d, 'P')] for d in eval_dates) == q.get('P', 0))
                     model.Add(sum(works[(emp_id, d, 'r')] for d in eval_dates) == q.get('r', 0))
-                    model.Add(sum(works[(emp_id, d, 'R')] for d in eval_dates) == q.get('R', 0))
+                   #model.Add(sum(works[(emp_id, d, 'R')] for d in eval_dates) == q.get('R', 0))
                     model.Add(sum(is_overtime_vars[(emp_id, d)] for d in eval_dates) == q.get('O', 0))
-                    # 👇 💡 [新增] 夜班總數鎖死：該員工的 夜B1 + 夜B2 總和，必須絕對等於 QSpinBox 給的 '夜'
-                    model.Add(sum(works[(emp_id, d, '01夜B1')] + works[(emp_id, d, '01夜B2')] for d in eval_dates) == q.get('夜', 0))
+                    # 👇 💡 [修改] 夜班總數鎖死：從「參照區間 (night_dates)」計算
+                    night_eval_dates = [d for d in eval_dates if d in night_dates]
+                    night_outside_dates = [d for d in night_dates if d not in eval_dates]
+                    
+                    # 結算該員工在「參照區間」但「非運算區間」已經確定的夜班
+                    already_night = 0
+                    for d in night_outside_dates:
+                        record = dict_sched_overall.get((emp_id, d))
+                        if record and record['shift_code'] in ('01夜B1', '01夜B2'):
+                            already_night += 1
+                            
+                    # 本次引擎針對重疊天數應該排出的夜班數 = 總配額 - 既有夜班
+                    target_night = max(0, q.get('夜', 0) - already_night)
+                    
+                    # 限制引擎只能在重疊區間 (night_eval_dates) 受 QSpinBox 限制
+                    if night_eval_dates:
+                        model.Add(sum(works[(emp_id, d, '01夜B1')] + works[(emp_id, d, '01夜B2')] for d in night_eval_dates) == target_night)
+                    
+                    # 🚨 不在 night_eval_dates 裡的日子 (如：在主運算內，但不在參照區內)，
+                    # 將直接不綁定 QSpinBox，讓引擎視人力需求自由指派。
                     
                     # 💡 [移除] 把 01中A 和 01泛用 的強迫配額刪除！
                     # 引擎現在可以為了大局，自由地把中A和泛用發放給合適的員工。
@@ -358,30 +410,30 @@ class ScheduleEngine:
             
             for emp_id in emp_ids:
                 # 條件 1：任何連續 7 天內，(上班 + P + L) 最多只能 6 天
-                # (這條防線負責確保「絕對不會出現連續上 7 天班」的狀況，不受區塊切分影響)
-                for i in range(len(all_eval_dates) - 6):
-                    window_wpl = []
-                    for j in range(7):
-                        d = all_eval_dates[i+j]
-                        if d < eval_dates[0]:
-                            shift = dict_history.get((emp_id, d))
-                            val = 1 if (shift in WORK_SHIFTS or shift in ['P', 'L']) else 0
-                            window_wpl.append(val)
-                        else:
-                            val = is_working[(emp_id, d)] + works[(emp_id, d, 'P')] + works[(emp_id, d, 'L')]
-                            window_wpl.append(val)
-                    model.Add(sum(window_wpl) <= 6)
+                if rule_config.get('hard_law_7_in_1', True):
+                    for i in range(len(all_eval_dates) - 6):
+                        window_wpl = []
+                        for j in range(7):
+                            d = all_eval_dates[i+j]
+                            if d < eval_dates[0]:
+                                shift = dict_history.get((emp_id, d))
+                                val = 1 if (shift in WORK_SHIFTS or shift in ['P', 'L']) else 0
+                                window_wpl.append(val)
+                            else:
+                                val = is_working[(emp_id, d)] + works[(emp_id, d, 'P')] + works[(emp_id, d, 'L')]
+                                window_wpl.append(val)
+                        model.Add(sum(window_wpl) <= 6)
                 
-                # 👇 💡 [修正] 條件 2：從排班第一天起，每 7 天一個絕對區間，每個區間只能有 1 個 R
+                # 條件 2：從排班第一天起，每 7 天一個絕對區間，每個區間只能有 1 個 R
                 if not debug_mode:
                     for i in range(0, len(eval_dates), 7):
                         chunk_dates = eval_dates[i:i+7]
                         window_R = [works[(emp_id, d, 'R')] for d in chunk_dates]
                         
                         if len(chunk_dates) == 7:
-                            model.Add(sum(window_R) == 1) # 完整七天強制 1 個 R
+                            model.Add(sum(window_R) == 1) # 💡 完整 7 天區塊，引擎會自己挑 1 天放 R
                         else:
-                            model.Add(sum(window_R) <= 1) # 殘缺的尾段天數最多 1 個 R
+                            model.Add(sum(window_R) <= 1) # 💡 不足 7 天的尾端，最多放 1 個 R
             
                 # 💡 [修改] 加入控制台判斷
                 if rule_config.get('hard_no_4_off', True):            
@@ -407,7 +459,7 @@ class ScheduleEngine:
                             model.Add(sum(is_off[(emp_id, d)] for d in window_dates) <= 3)
 
             # 5. 交接班時序防線
-            if strict_time_rules and not debug_mode:
+            if strict_time_rules and not debug_mode and rule_config.get('hard_clash', True):
                 for emp_id in emp_ids:
                     s_pref = shift_prefs.get(str(emp_id).strip(), 'MIX')
                     for i in range(len(all_eval_dates) - 1):
@@ -425,7 +477,8 @@ class ScheduleEngine:
                         tmr = all_eval_dates[i+2]
                         if tmr < eval_dates[0]: continue
                         
-                        if s_pref != 'NIGHT_ONLY':
+                        # 加入 rule_config 判斷，預設為 True
+                        if s_pref != 'NIGHT_ONLY' and rule_config.get('hard_night_2_off', True):
                             just_started_off_after_night = model.NewBoolVar(f'night_to_off_{emp_id}_{today}')
                             model.Add(just_started_off_after_night == 1).OnlyEnforceIf([is_night[(emp_id, ytd)], is_off[(emp_id, today)]])
                             model.AddImplication(just_started_off_after_night, is_off[(emp_id, tmr)])
@@ -436,7 +489,7 @@ class ScheduleEngine:
             WEIGHT_SHIFT_PREF = 10 if rule_config.get('soft_shift_pref', True) else 0       
             WEIGHT_BLOCK_PREF = 5  if rule_config.get('soft_block_pref', True) else 0
             WEIGHT_LOCATION_MIX = 5 if rule_config.get('soft_loc_mix', True) else 0      # 💡 中等權重：避免連兩天同地點
-            WEIGHT_NIGHT_SEGMENT = 10 if rule_config.get('soft_night_seg', True) else 0     # 💡 [新增] 夜班分段偏好的扣分權重
+            WEIGHT_NIGHT_SEGMENT = 50 if rule_config.get('soft_night_seg', True) else 0     # 💡 [新增] 夜班分段偏好的扣分權重
 
 
             WEIGHT_BALANCE_EARLY_NOON = 100 if rule_config.get('soft_bal_early_noon', True) else 0 # 💡 [新增] 早午班平均權重 (設定為 3，讓它具有一定影響力但不至於蓋過員工意願) 
@@ -445,10 +498,10 @@ class ScheduleEngine:
             WEIGHT_C_SHIFT_BALANCE = 5 if rule_config.get('soft_bal_c', True) else 0        # 💡 [新增] Normal 員工 C 班平分的扣分權重
  
             WEIGHT_A_SHIFT_BALANCE = 10 if rule_config.get('soft_bal_a', True) else 0    # 💡 [新增] 中A班平分的扣分權重
-            WEIGHT_SUPPORT_BALANCE = 10 if rule_config.get('soft_bal_support', True) else 0 # 💡 [新增] 支援班平分權重
+            WEIGHT_SUPPORT_BALANCE = 80 if rule_config.get('soft_bal_support', True) else 0 # 💡 [新增] 支援班平分權重
            
             WEIGHT_A_SHIFT_MAX_1 = 50     # 💡 [新增] 中A班超過1天的極重度防線權重
-            WEIGHT_M_SHIFT_BONUS = 1      # 💡 [新增] m 班別優先權重 (+1分)
+            WEIGHT_M_SHIFT_BONUS = 10      # 💡 [新增] m 班別優先權重 (+1分)
 
             shift_pref_score = []
             block_penalty_score = []
@@ -993,7 +1046,14 @@ class ScheduleEngine:
                 )
 
             solver = cp_model.CpSolver()
+            self.current_solver = solver  # 綁定到實例，讓 cancel() 抓得到
             solver.parameters.max_time_in_seconds = 600.0 
+            # 👇 開啟多核心平行運算 (例如設定為 4 或 8 核心，視你的硬體而定)
+            # 預設為 1 核心，開啟後對於複雜的排班限制解題速度會有顯著提升
+            solver.parameters.num_search_workers = 3  # 可依硬體調整，建議不要超過 CPU 核心數
+
+            # 👇 加入這兩行開啟底層日誌
+            solver.parameters.log_search_progress = True
             return solver.Solve(model), solver, works, virtual_vars_dict
             # 💡 回傳時多帶上虛擬人力的變數字典
 
@@ -1003,6 +1063,10 @@ class ScheduleEngine:
         print("🔍 啟動排班主引擎 (含虛擬人力避震器)...")
         status, solver, works, virtual_vars = attempt_solve(strict_time_rules=True, strict_quotas=True)
         
+        # 捕捉取消事件 (主引擎)
+        if self.is_cancelled:
+            return False, "🛑 運算已由使用者手動取消。"
+
         if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             # 結算到底動用了多少虛擬人力
             total_virtual_used = sum(solver.Value(v) for v in virtual_vars.values())
@@ -1021,8 +1085,12 @@ class ScheduleEngine:
                 # 💡 在背景悄悄執行降級探針，純粹作為 Debug 診斷報告
                 print("⚠️ 偵測到缺口，啟動背景死結診斷探針...")
                 status_nt, solver_nt, _, v_vars_nt = attempt_solve(strict_time_rules=False, strict_quotas=True)
+                if self.is_cancelled: return False, "🛑 運算已由使用者手動取消。" # 新增
+                status_nt, solver_nt, _, v_vars_nt = attempt_solve(strict_time_rules=False, strict_quotas=True)
                 v_used_nt = sum(solver_nt.Value(v) for v in v_vars_nt.values()) if status_nt in (cp_model.OPTIMAL, cp_model.FEASIBLE) else float('inf')
                 
+                status_nq, solver_nq, _, v_vars_nq = attempt_solve(strict_time_rules=True, strict_quotas=False)
+                if self.is_cancelled: return False, "🛑 運算已由使用者手動取消。" # 新增
                 status_nq, solver_nq, _, v_vars_nq = attempt_solve(strict_time_rules=True, strict_quotas=False)
                 v_used_nq = sum(solver_nq.Value(v) for v in v_vars_nq.values()) if status_nq in (cp_model.OPTIMAL, cp_model.FEASIBLE) else float('inf')
                 
