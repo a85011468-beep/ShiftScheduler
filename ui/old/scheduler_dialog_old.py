@@ -3,9 +3,9 @@ import re
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, 
                                QLabel, QDateEdit, QMessageBox, QFileDialog, QTableWidget, 
                                QTableWidgetItem, QHeaderView, QSpinBox, QAbstractSpinBox,
-                               QComboBox,QProgressDialog)
+                               QComboBox) # 💡 新增 QComboBox
 
-from PySide6.QtCore import Qt, QDate, QSettings, QThread, Signal
+from PySide6.QtCore import Qt, QDate, QSettings
 from PySide6.QtGui import QColor, QFont
 from datetime import datetime
 import pandas as pd
@@ -20,156 +20,16 @@ from ui.run_config_dialog import RunConfigDialog
 class CustomSpinBox(QSpinBox):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self.setButtonSymbols(QAbstractSpinBox.NoButtons) # 隱藏上下箭頭
+        # 💡 強制關閉滑鼠滾輪干擾，防止滑鼠滑過時意外滾動改變數字
         self.setFocusPolicy(Qt.StrongFocus) 
 
     def focusInEvent(self, event):
+        """重寫聚焦事件：當滑鼠移入或點擊時，不允許它自動全選文字"""
         super().focusInEvent(event)
+        # 延遲取消全選，防止 Qt 預設行為干涉
         from PySide6.QtCore import QTimer
         QTimer.singleShot(0, self.lineEdit().deselect)
-
-class ExportPreviewDialog(QDialog):
-    def __init__(self, db_manager, start_date, end_date, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(f"預覽與修改班表 ({start_date} 至 {end_date})")
-        self.resize(1000, 600)
-        self.db = db_manager
-        self.start_date = start_date
-        self.end_date = end_date
-        self.pivot_df = None
-        
-        self.setup_ui()
-        self.load_data()
-
-    def setup_ui(self):
-        layout = QVBoxLayout(self)
-        
-        info_label = QLabel("💡 請在此處確認或直接修改班表。修改完成後點擊「確認並匯出」。\n⚠️ 注意：此處的任何修改將會同步更新至系統資料庫！")
-        info_label.setStyleSheet("color: #1565C0; font-weight: bold; font-size: 14px;")
-        layout.addWidget(info_label)
-        
-        self.table = QTableWidget()
-        self.table.setAlternatingRowColors(True)
-        self.table.setStyleSheet("""
-            QTableWidget { font-size: 13px; }
-            QTableWidget::item:focus { background-color: #E3F2FD; color: black; font-weight: bold; }
-        """)
-        layout.addWidget(self.table)
-        
-        btn_layout = QHBoxLayout()
-        self.btn_export = QPushButton("💾 確認並匯出")
-        self.btn_export.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; height: 35px; font-size: 14px;")
-        self.btn_export.clicked.connect(self.on_confirm)
-        
-        self.btn_cancel = QPushButton("取消匯出")
-        self.btn_cancel.setStyleSheet("height: 35px; font-size: 14px;")
-        self.btn_cancel.clicked.connect(self.reject)
-        
-        btn_layout.addStretch()
-        btn_layout.addWidget(self.btn_cancel)
-        btn_layout.addWidget(self.btn_export)
-        layout.addLayout(btn_layout)
-
-    def load_data(self):
-        schedules = self.db.get_schedule_by_date_range(self.start_date, self.end_date)
-        if not schedules:
-            return
-
-        employees = self.db.get_all_active_employees()
-        level_dict = {str(e['emp_id']).strip(): str(e['job_level']).strip() for e in employees}
-        name_dict = {str(e['emp_id']).strip(): e['name'] for e in employees}
-
-        df = pd.DataFrame(schedules)
-        self.pivot_df = df.pivot(index='emp_id', columns='date', values='shift_code').fillna('')
-        self.pivot_df.index = self.pivot_df.index.astype(str).str.strip()
-
-        # 排序邏輯 (依職級)
-        def sort_key(emp_id):
-            level = level_dict.get(emp_id, 'Normal')
-            if level == 'Chief': return (0, emp_id)
-            elif level == 'M': return (1, emp_id)
-            else: return (2, emp_id)
-
-        sorted_emp_ids = sorted(self.pivot_df.index, key=sort_key)
-        self.pivot_df = self.pivot_df.reindex(sorted_emp_ids)
-
-        # 設定表格
-        self.table.setRowCount(len(self.pivot_df))
-        self.table.setColumnCount(len(self.pivot_df.columns))
-        self.table.setHorizontalHeaderLabels(self.pivot_df.columns)
-        
-        y_labels = [f"{emp_id} {name_dict.get(emp_id, '')}" for emp_id in self.pivot_df.index]
-        self.table.setVerticalHeaderLabels(y_labels)
-
-        # 填入資料並設定週日樣式
-        for row_idx, emp_id in enumerate(self.pivot_df.index):
-            for col_idx, date in enumerate(self.pivot_df.columns):
-                val = str(self.pivot_df.at[emp_id, date]).strip()
-                item = QTableWidgetItem(val)
-                item.setTextAlignment(Qt.AlignCenter)
-                
-                try:
-                    dt = datetime.strptime(date, '%Y-%m-%d')
-                    if dt.weekday() == 6: # 週日微紅底色提示
-                        item.setBackground(QColor("#FCE4EC"))
-                except ValueError:
-                    pass
-                
-                self.table.setItem(row_idx, col_idx, item)
-
-    def on_confirm(self):
-        conn = self.db.get_connection()
-        cursor = conn.cursor()
-        
-        # 遍歷網格，讀取使用者的修改並更新 DataFrame 與資料庫
-        for row_idx in range(self.table.rowCount()):
-            emp_id = str(self.pivot_df.index[row_idx])
-            for col_idx in range(self.table.columnCount()):
-                date = str(self.pivot_df.columns[col_idx])
-                
-                item = self.table.item(row_idx, col_idx)
-                new_val = item.text().strip() if item else ""
-                old_val = str(self.pivot_df.at[emp_id, date]).strip()
-                
-                # 如果有變更，才進行資料庫寫入
-                if new_val != old_val:
-                    self.pivot_df.at[emp_id, date] = new_val
-                    
-                    cursor.execute("SELECT 1 FROM schedule WHERE emp_id=? AND date=?", (emp_id, date))
-                    if cursor.fetchone():
-                        cursor.execute("UPDATE schedule SET shift_code=? WHERE emp_id=? AND date=?", (new_val, emp_id, date))
-                    else:
-                        cursor.execute("INSERT INTO schedule (emp_id, date, shift_code, is_locked) VALUES (?, ?, ?, 0)", (emp_id, date, new_val))
-                        
-        conn.commit()
-        conn.close()
-        
-        self.accept()
-class EngineWorker(QThread):
-    finished_signal = Signal(bool, str)
-    
-    def __init__(self, engine, start_date, end_date, night_start, night_end, leave_quotas, rule_config, parent=None):
-        super().__init__(parent)
-        self.engine = engine
-        self.start_date = start_date
-        self.end_date = end_date
-        self.night_start = night_start
-        self.night_end = night_end
-        self.leave_quotas = leave_quotas
-        self.rule_config = rule_config
-        
-    def run(self):
-        # 呼叫 engine.run_scheduler 時，也要把這兩個參數傳進去
-        success, message = self.engine.run_scheduler(
-            self.start_date, 
-            self.end_date, 
-            self.night_start,
-            self.night_end,
-            self.leave_quotas, 
-            rule_config=self.rule_config
-        )
-        # 運算結束後，發送訊號通知主畫面
-        self.finished_signal.emit(success, message)
 
 class SchedulerDialog(QDialog):
     def __init__(self, db_manager, parent=None):
@@ -178,8 +38,10 @@ class SchedulerDialog(QDialog):
         self.resize(1100, 700) 
         self.db = db_manager
         
+        # 初始化 QSettings (使用與主程式相同的命名空間，但用不同的 Key)
         self.settings = QSettings("MyUnit", "ShiftScheduler")
         
+        # 存放每個員工的請假滾輪元件 {emp_id: {'L': QSpinBox, 'P': QSpinBox}}
         self.leave_spinboxes = {} 
 
         self.setup_ui()
@@ -188,14 +50,16 @@ class SchedulerDialog(QDialog):
     def setup_ui(self):
         layout = QVBoxLayout(self)
 
-        # === 頂部控制區 (第一排：主運算) ===
+        # === 頂部控制區 ===
         ctrl_layout = QHBoxLayout()
 
+        # 🧮 [新增] 人力配額純試算按鈕 (建議可以放在佈局的開頭，符合左上的需求)
         self.btn_check_manpower = QPushButton("🧮 試算人力配額")
         self.btn_check_manpower.setStyleSheet("background-color: #607D8B; color: white; font-weight: bold; height: 35px; padding: 0 15px;")
         self.btn_check_manpower.clicked.connect(self.on_check_manpower_clicked)
-        ctrl_layout.addWidget(self.btn_check_manpower)
+        ctrl_layout.addWidget(self.btn_check_manpower) # 根據您的版面，也可能是加入到 top_layout
         
+        # 1. 🔧 [功能一] 記憶起始日期
         self.date_start = QDateEdit()
         self.date_start.setCalendarPopup(True)
         saved_start = self.settings.value("scheduler_start_date", "")
@@ -204,9 +68,10 @@ class SchedulerDialog(QDialog):
         else:
             self.date_start.setDate(QDate.currentDate().addDays(-QDate.currentDate().day() + 1))
         self.date_start.dateChanged.connect(self.refresh_table)
-        ctrl_layout.addWidget(QLabel("🎯 主運算區間："))
+        ctrl_layout.addWidget(QLabel("目標運算區間："))
         ctrl_layout.addWidget(self.date_start)
 
+        # 2. 🔧 [功能一] 記憶結束日期
         self.date_end = QDateEdit()
         self.date_end.setCalendarPopup(True)
         saved_end = self.settings.value("scheduler_end_date", "")
@@ -218,87 +83,73 @@ class SchedulerDialog(QDialog):
         ctrl_layout.addWidget(QLabel("至"))
         ctrl_layout.addWidget(self.date_end)
 
+        # 功能按鈕群
         self.btn_run = QPushButton("⚡ 執行智能排班")
         self.btn_run.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; height: 35px; padding: 0 15px;")
         self.btn_run.clicked.connect(self.on_run_engine_clicked)
         ctrl_layout.addWidget(self.btn_run)
 
+        # 👇 💡 新增：Debug 排班按鈕 👇
         self.btn_debug_run = QPushButton("🐛 Debug 勞基法排班")
         self.btn_debug_run.setStyleSheet("background-color: #9C27B0; color: white; font-weight: bold; height: 35px; padding: 0 15px;")
         self.btn_debug_run.clicked.connect(self.on_debug_run_clicked)
         ctrl_layout.addWidget(self.btn_debug_run)
+        # 👆 新增結束 👆
 
+        # 🔍 [新增] 獨立的條件診斷器按鈕
         self.btn_rule_debug = QPushButton("🔍 班表規則診斷")
         self.btn_rule_debug.setStyleSheet("background-color: #00BCD4; color: white; font-weight: bold; height: 35px; padding: 0 15px;")
         self.btn_rule_debug.clicked.connect(self.on_rule_debug_clicked)
         ctrl_layout.addWidget(self.btn_rule_debug)
 
-        # === 頂部控制區 (第二排：夜班參照與輔助功能) ===
-        ctrl_layout2 = QHBoxLayout()
-        
-        self.night_date_start = QDateEdit()
-        self.night_date_start.setCalendarPopup(True)
-        saved_night_start = self.settings.value("scheduler_night_start", saved_start)
-        if saved_night_start:
-            self.night_date_start.setDate(QDate.fromString(saved_night_start, "yyyy-MM-dd"))
-        self.night_date_start.dateChanged.connect(self.refresh_table)
-        
-        self.night_date_end = QDateEdit()
-        self.night_date_end.setCalendarPopup(True)
-        saved_night_end = self.settings.value("scheduler_night_end", saved_end)
-        if saved_night_end:
-            self.night_date_end.setDate(QDate.fromString(saved_night_end, "yyyy-MM-dd"))
-        self.night_date_end.dateChanged.connect(self.refresh_table)
-
-        ctrl_layout2.addWidget(QLabel("🌙 夜班 QSpinBox 參照區間："))
-        ctrl_layout2.addWidget(self.night_date_start)
-        ctrl_layout2.addWidget(QLabel("至"))
-        ctrl_layout2.addWidget(self.night_date_end)
-        ctrl_layout2.addStretch() # 推向左側
-
         self.btn_import_pre = QPushButton("📥 匯入預排 (Excel)")
         self.btn_import_pre.clicked.connect(self.on_import_pre_schedule_clicked)
-        ctrl_layout2.addWidget(self.btn_import_pre)
+        ctrl_layout.addWidget(self.btn_import_pre)
         
         self.btn_clear_pre = QPushButton("🗑️ 清除區間預排")
         self.btn_clear_pre.clicked.connect(self.on_clear_pre_schedule_clicked)
-        ctrl_layout2.addWidget(self.btn_clear_pre)
+        ctrl_layout.addWidget(self.btn_clear_pre)
 
+        # 3. 🔧 [功能二] 新增「刪除未來班表」按鈕
         self.btn_clear = QPushButton("🗑️ 清空區間未鎖定班表")
         self.btn_clear.setStyleSheet("background-color: #795548; color: white; font-weight: bold; height: 35px; padding: 0 15px;")
         self.btn_clear.clicked.connect(self.on_clear_schedule_clicked)
-        ctrl_layout2.addWidget(self.btn_clear)
+        ctrl_layout.addWidget(self.btn_clear)
 
         self.btn_export = QPushButton("💾 滿意並匯出 Excel")
         self.btn_export.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; height: 35px; padding: 0 15px;")
         self.btn_export.clicked.connect(self.on_export_clicked)
-        ctrl_layout2.addWidget(self.btn_export)
+        ctrl_layout.addWidget(self.btn_export)
 
+        # 🔧 [新增] 週期統計按鈕
         self.btn_stats = QPushButton("📊 週期班別統計")
         self.btn_stats.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold; height: 35px; padding: 0 15px;")
         self.btn_stats.clicked.connect(self.on_stats_clicked)
-        ctrl_layout2.addWidget(self.btn_stats)
+        ctrl_layout.addWidget(self.btn_stats)
 
         layout.addLayout(ctrl_layout)
-        layout.addLayout(ctrl_layout2)
 
         # === 表格區 ===
-        layout.addWidget(QLabel("💡 提示：左側可設定引擎代排的 L(特休)/P(事假) 天數總額。\n UI 日期範圍為 [主運算] 與 [夜班參照] 的最大涵蓋範圍，未選定運算的日子引擎不會更動。"))
+        layout.addWidget(QLabel("💡 提示：左側可設定引擎代排的 L(特休)/P(事假) 天數總額。底限為已被鎖定的歷史請假天數。"))
         self.table = QTableWidget()
         self.table.setAlternatingRowColors(True)
+        # 💡 開啟滑鼠追蹤，讓 hover 效果能順暢觸發
         self.table.setMouseTracking(True) 
         
+        # 💡 注入高對比 QSS 樣式碼
         self.table.setStyleSheet("""
             QTableWidget {
                 alternate-background-color: #f2f2f2;
-                font-size: 13px;
+                font-size: 13px; /* 基礎字體大小 */
             }
+            /* 1. 滑鼠懸停 (Hover) 時的樣式：亮黃底、黑字、放大加粗 */
             QTableWidget::item:hover {
                 background-color: #FFD54F; 
                 color: #000000;
                 font-size: 15px; 
                 font-weight: bold;
             }
+            /* 2. 點擊選取 (Selected) 時的樣式：道奇藍底、純白字、放大加粗 */
             QTableWidget::item:selected {
                 background-color: #1E90FF;
                 color: #FFFFFF;
@@ -307,30 +158,28 @@ class SchedulerDialog(QDialog):
             }
         """)
         layout.addWidget(self.table)
+
+        # (您的 __init__ 或 setup_ui 前面的程式碼...)
         
+        # 💡 將日期選擇器的數值變更信號，綁定到重繪表格函式
+        self.date_start.dateChanged.connect(self.refresh_table)
+        self.date_end.dateChanged.connect(self.refresh_table)
+        
+        # 💡 視窗一打開，立刻觸發第一次強制渲染
         self.refresh_table()
-    # 取得主運算區間
+
     def get_selected_dates(self):
         return self.date_start.date().toString("yyyy-MM-dd"), self.date_end.date().toString("yyyy-MM-dd")
-    # 取得夜班參照區間
-    def get_night_dates(self):
-        return self.night_date_start.date().toString("yyyy-MM-dd"), self.night_date_end.date().toString("yyyy-MM-dd")
-    
-    def get_ui_dates(self):
-        d1 = self.date_start.date()
-        d2 = self.date_end.date()
-        d3 = self.night_date_start.date()
-        d4 = self.night_date_end.date()
-        start_date = min(d1, d3).toString("yyyy-MM-dd")
-        end_date = max(d2, d4).toString("yyyy-MM-dd")
-        return start_date, end_date
     
     def on_rule_debug_clicked(self):
+        """開啟勾選式的班表規則診斷器"""
         start_date, end_date = self.get_selected_dates()
         dialog = DebugDialog(self.db, start_date, end_date, self)
         dialog.exec()
 
+
     def _get_gradient_color(self, val):
+        """依據上班人數回傳漸變背景色"""
         if val <= 8: return QColor(255, 170, 170)
         elif val >= 15: return QColor(170, 255, 170)
         else:
@@ -346,18 +195,12 @@ class SchedulerDialog(QDialog):
             return QColor(r, g, b)
 
     def refresh_table(self):
+        # 💡 [修復重疊 Bug 核心] 完全摧毀並重置舊的 CellWidgets，避免 Qt 殘留幽靈元件
         self.table.clearContents()
         self.table.setRowCount(0)
         self.table.setColumnCount(0)
         
-        # 💡 取得三種不同的日期範圍
-        main_start, main_end = self.get_selected_dates()
-        night_start, night_end = self.get_night_dates()
-        ui_start, ui_end = self.get_ui_dates()
-        
-        main_dates = pd.date_range(start=main_start, end=main_end).strftime('%Y-%m-%d').tolist()
-        night_dates = pd.date_range(start=night_start, end=night_end).strftime('%Y-%m-%d').tolist()
-        date_columns = pd.date_range(start=ui_start, end=ui_end).strftime('%Y-%m-%d').tolist()
+        start_date, end_date = self.get_selected_dates()
         
         employees = self.db.get_all_active_employees()
         if not employees:
@@ -370,7 +213,9 @@ class SchedulerDialog(QDialog):
         name_dict = {str(e['emp_id']).strip(): e['name'] for e in employees}
         emp_ids = [str(e['emp_id']).strip() for e in employees]
         
-        schedules = self.db.get_schedule_by_date_range(ui_start, ui_end)
+        date_columns = pd.date_range(start=start_date, end=end_date).strftime('%Y-%m-%d').tolist()
+        
+        schedules = self.db.get_schedule_by_date_range(start_date, end_date)
         
         if schedules:
             df = pd.DataFrame(schedules)
@@ -390,12 +235,42 @@ class SchedulerDialog(QDialog):
         sorted_emp_ids = sorted(pivot_df.index, key=sort_key)
         pivot_df = pivot_df.reindex(sorted_emp_ids)
 
-        # 欄位定義與對齊 (0:L, 1:P, 2:r, 3:R, 4:O, 5:夜, 6:固定, 7:剩餘)
-        self.control_keys = ['L', 'P', 'r', 'R', 'O', '夜']
-        headers = ["特休(L)", "事假(P)", "休息(r)", "例假(R)", "加班(O)", "夜班", "固定", "剩餘(天)"]
+        # ==========================================
+        # 🎯 跨期邊界偵測與左右佈局拆分 (加入 加班 O 欄位)
+        # ==========================================
+        self.split_date = None
+        saved_audit = self.settings.value("audit_start_date", "")
+        if saved_audit:
+            audit_start = QDate.fromString(saved_audit, "yyyy-MM-dd")
+            audit_end = audit_start.addDays(55) 
+            s_qdate = self.date_start.date()
+            e_qdate = self.date_end.date()
+            
+            if s_qdate <= audit_end and e_qdate > audit_end:
+                self.split_date = audit_end.toString("yyyy-MM-dd")
 
-        all_headers = headers + date_columns
+        # 💡 [UI 優化] 把期內放左邊，期外放右邊
+        if self.split_date:
+            headers_left = ["L(期內)", "P(期內)", "r(期內)", "R(期內)", "加班(O內)", "固定", "剩餘(內)"]
+            headers_right = ["L(跨出)", "P(跨出)", "r(跨出)", "R(跨出)", "加班(O外)", "剩餘(外)"]
+            self.control_keys_left = ['L', 'P', 'r', 'R', 'O']
+            self.control_keys_right = ['L2', 'P2', 'r2', 'R2', 'O2']
+            p1_dates = [d for d in date_columns if d <= self.split_date]
+            p2_dates = [d for d in date_columns if d > self.split_date]
+        else:
+            headers_left = ["特休(L)", "事假(P)", "休息(r)", "例假(R)", "加班(O)", "固定", "剩餘(天)"]
+            headers_right = []
+            self.control_keys_left = ['L', 'P', 'r', 'R', 'O']
+            self.control_keys_right = []
+            p1_dates = date_columns
+            p2_dates = []
 
+        total_days_p1 = len(p1_dates)
+        total_days_p2 = len(p2_dates)
+
+        all_headers = headers_left + date_columns + headers_right
+        # 💡 [新增] 定義底部的統計列與對應的班別代碼
+        # 💡 [修改] 將 c 班別合併統計，以維持介面簡潔並正確觸發紅綠燈
         self.stats_rows = [
             ("早M", ["01早M"]), ("早m", ["01早m"]), 
             ("早B1(含c)", ["01早B1", "01早B1c"]), ("早B2(含c)", ["01早B2", "01早B2c"]),
@@ -405,8 +280,11 @@ class SchedulerDialog(QDialog):
             ("夜(B1+B2)", ["01夜B1", "01夜B2"])
         ]
 
+        all_headers = headers_left + date_columns + headers_right
+        # 💡 改為：1 (批次列) + 員工總數 + 詳細統計的列數
         self.table.setRowCount(len(pivot_df) + 1 + len(self.stats_rows))
         self.table.setColumnCount(len(all_headers))
+
 
         for col_idx, header_text in enumerate(all_headers):
             item = QTableWidgetItem(header_text)
@@ -424,6 +302,7 @@ class SchedulerDialog(QDialog):
             
         self.table.horizontalHeader().setStyleSheet("QHeaderView::section { padding: 4px; border: 1px solid #ccc; }")
         
+        # 💡 Y 軸標籤也展開
         y_labels = ["⚡ 批次套用"] + [f"{emp_id} {name_dict.get(emp_id, '')}" for emp_id in pivot_df.index] + [f"📊 {label}" for label, _ in self.stats_rows]
         self.table.setVerticalHeaderLabels(y_labels)
 
@@ -432,22 +311,29 @@ class SchedulerDialog(QDialog):
             def update_all_emps(val):
                 for e_id, widgets in self.leave_widgets.items():
                     w = widgets.get(key)
-                    if isinstance(w, QSpinBox) and w.isEnabled():
+                    if isinstance(w, QSpinBox):
                         w.setValue(val) if val >= w.minimum() else w.setValue(w.minimum())
             return update_all_emps
 
-        for col_idx, key in enumerate(self.control_keys):
+        # 繪製左側批次套用
+        for col_idx, key in enumerate(self.control_keys_left):
             spin = CustomSpinBox()
-            # 💡 依據類型動態限制批次輸入框的最大上限
-            if key == '夜':
-                spin.setRange(0, len(night_dates))
-            else:
-                spin.setRange(0, len(main_dates))
+            spin.setRange(0, total_days_p1)
             spin.setStyleSheet("background-color: #FFF9C4; color: black; font-weight: bold; border: 1px solid #ccc;")
             spin.valueChanged.connect(make_batch_updater(key))
             self.table.setCellWidget(0, col_idx, spin)
 
-        # 第 0 列其餘格子變灰色唯讀
+        # 繪製右側批次套用 (如果在最右側)
+        if self.split_date:
+            right_offset = len(headers_left) + len(date_columns)
+            for i, key in enumerate(self.control_keys_right):
+                spin = CustomSpinBox()
+                spin.setRange(0, total_days_p2)
+                spin.setStyleSheet("background-color: #E1BEE7; color: black; font-weight: bold; border: 1px solid #ccc;")
+                spin.valueChanged.connect(make_batch_updater(key))
+                self.table.setCellWidget(0, right_offset + i, spin)
+
+        # 把未放置 SpinBox 的第 0 列格子變成灰色唯讀
         for col_idx in range(len(all_headers)):
             if not self.table.cellWidget(0, col_idx):
                 item = QTableWidgetItem("")
@@ -455,43 +341,50 @@ class SchedulerDialog(QDialog):
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable) 
                 self.table.setItem(0, col_idx, item)
 
-        # 更新剩餘天數 (只看主運算區間)
-        def make_updater(emp_id, fixed_main):
+        def make_updater(emp_id, fixed_p1, fixed_p2):
             def update():
                 widgets = self.leave_widgets[emp_id]
-                consumed_main = fixed_main
-                # 💡 剩餘天數計算只累加與主運算區間相關的 fake 假別
-                for k in ['L', 'P', 'r', 'R', 'O']:
-                    w = widgets.get(k)
-                    if isinstance(w, QSpinBox):
-                        consumed_main += w.value()
-                    elif isinstance(w, QLabel):
-                        consumed_main += int(w.text())
                 
-                # 剩餘可排班天數 = 主運算總天數 - 已消耗天數
-                rem = len(main_dates) - consumed_main
-                lbl_rem = self.remaining_labels[emp_id]
-                lbl_rem.setText(str(rem))
-                lbl_rem.setStyleSheet(
-                    "color: #1565C0; font-weight: bold;" if rem >= 0
-                    else "background-color: #FFCDD2; color: #B71C1C; font-weight: bold; border: 1px solid #B71C1C;"
-                )
+                # 計算期內剩餘天數
+                consumed_p1 = fixed_p1
+                for k in self.control_keys:
+                    w = widgets.get(k)
+                    consumed_p1 += w.value() if isinstance(w, QSpinBox) else int(w.text())
+                
+                rem_p1 = total_days_p1 - consumed_p1
+                lbl_rem_p1 = self.remaining_labels[f"{emp_id}_p1"]
+                lbl_rem_p1.setText(str(rem_p1))
+                lbl_rem_p1.setStyleSheet("color: #1565C0; font-weight: bold;" if rem_p1 >= 0 else "background-color: #FFCDD2; color: #B71C1C; font-weight: bold; border: 1px solid #B71C1C;")
+
+                # 計算期外剩餘天數 (如果有分期)
+                if self.split_date:
+                    consumed_p2 = fixed_p2
+                    for k in self.control_keys:
+                        w = widgets.get(k)
+                        consumed_p2 += w.value() if isinstance(w, QSpinBox) else int(w.text())
+                    
+                    rem_p2 = total_days_p2 - consumed_p2
+                    lbl_rem_p2 = self.remaining_labels[f"{emp_id}_p2"]
+                    lbl_rem_p2.setText(str(rem_p2))
+                    lbl_rem_p2.setStyleSheet("color: #1565C0; font-weight: bold;" if rem_p2 >= 0 else "background-color: #FFCDD2; color: #B71C1C; font-weight: bold; border: 1px solid #B71C1C;")
             return update
 
-        # 繪製每一列員工
+        # 開始繪製每一列員工
         for row_idx, emp_id in enumerate(pivot_df.index):
             real_row = row_idx + 1 
-            emp_level = level_dict.get(str(emp_id).strip(), 'Normal')
-            
-            # 💡 區分主區間資料與夜班區間資料
-            emp_main_data = pivot_df.loc[emp_id, main_dates]
-            emp_night_data = pivot_df.loc[emp_id, night_dates]
+            emp_data = pivot_df.loc[emp_id]
+            managed_states = ['L', 'P', 'r', 'R']
 
-            # 主區間內不可動的固定班別 (排除 L, P, r, R)
-            fixed_main = sum((emp_main_data != '') & (~emp_main_data.isin(['L', 'P', 'r', 'R'])))
+            emp_p1 = emp_data[p1_dates]
+            fixed_p1 = sum((emp_p1 != '') & (~emp_p1.isin(managed_states)))
+            
+            fixed_p2 = 0
+            if self.split_date:
+                emp_p2 = emp_data[p2_dates]
+                fixed_p2 = sum((emp_p2 != '') & (~emp_p2.isin(managed_states)))
 
             self.leave_widgets[emp_id] = {}
-            updater = make_updater(emp_id, fixed_main)
+            updater = make_updater(emp_id, fixed_p1, fixed_p2)
 
             def create_label(col_idx, key, val, style="background-color: #EEEEEE; color: #9E9E9E; border: 1px solid #ccc;"):
                 lbl = QLabel(str(val))
@@ -510,42 +403,20 @@ class SchedulerDialog(QDialog):
                 self.table.setCellWidget(real_row, col_idx, spin)
                 self.leave_widgets[emp_id][key] = spin
 
-            # 💡 欄位 0 ~ 4 初始化：只統計「主運算區間」內的數值
-            create_spinbox(0, 'L', sum(emp_main_data == 'L'), len(main_dates))
-            create_spinbox(1, 'P', sum(emp_main_data == 'P'), len(main_dates))
-            create_spinbox(2, 'r', sum(emp_main_data == 'r'), len(main_dates))
-            create_spinbox(3, 'R', sum(emp_main_data == 'R'), len(main_dates))
-            create_spinbox(4, 'O', 0, len(main_dates))
+            # 左側元件 (期內) - 💡 加入索引 4 的 O
+            create_spinbox(0, 'L', sum(emp_p1 == 'L'), total_days_p1)
+            create_spinbox(1, 'P', sum(emp_p1 == 'P'), total_days_p1)
+            create_spinbox(2, 'r', sum(emp_p1 == 'r'), total_days_p1)
+            create_spinbox(3, 'R', sum(emp_p1 == 'R'), total_days_p1)
+            create_spinbox(4, 'O', 0, total_days_p1) 
+            create_label(5, '固定(其他)', fixed_p1)
 
-            # 💡 欄位 5 初始化：只統計「夜班參照區間」內的夜班數
-            existing_night = sum(emp_night_data.isin(['01夜B1', '01夜B2']))
-            spin_night = CustomSpinBox()
+            rem_label_p1 = QLabel()
+            rem_label_p1.setAlignment(Qt.AlignCenter)
+            self.table.setCellWidget(real_row, 6, rem_label_p1)
+            self.remaining_labels[f"{emp_id}_p1"] = rem_label_p1
 
-            # 👇 將原本的 spin_night.setRange(0, len(night_dates)) 改為下方程式碼，以將下限設定為「已存在的數量」
-            spin_night.setRange(existing_night, len(night_dates))
-            spin_night.setValue(existing_night)
-            spin_night.setAlignment(Qt.AlignCenter)
-            spin_night.valueChanged.connect(updater)
-            
-            if emp_level == 'Normal':
-                spin_night.setEnabled(False)  
-                spin_night.setStyleSheet("background-color: #E0E0E0; color: #757575; border: 1px solid #ccc;")  
-            else:
-                spin_night.setStyleSheet("background-color: white; color: black; border: 1px solid #ddd;")
-                
-            self.table.setCellWidget(real_row, 5, spin_night)
-            self.leave_widgets[emp_id]['夜'] = spin_night
-
-            # 欄位 6：固定(其他)
-            create_label(6, '固定(其他)', fixed_main)
-
-            # 欄位 7：剩餘天數
-            rem_label = QLabel()
-            rem_label.setAlignment(Qt.AlignCenter)
-            self.table.setCellWidget(real_row, 7, rem_label)
-            self.remaining_labels[emp_id] = rem_label
-
-            # 右側中間日期網格 (顯示全部 UI 聯集區間)
+            # 中間網格 (日期)
             for col_offset, date in enumerate(date_columns):
                 val = str(pivot_df.at[emp_id, date]).strip()
                 item = QTableWidgetItem(val)
@@ -557,24 +428,47 @@ class SchedulerDialog(QDialog):
                     item.setBackground(QColor("#FFCDD2")) 
                     item.setForeground(QColor("#B71C1C")) 
                 
-                table_col = col_offset + len(headers)
+                table_col = col_offset + len(headers_left)
                 self.table.setItem(real_row, table_col, item)
 
-            updater()
+            # 右側元件 (跨出)
+            if self.split_date:
+                r_start = len(headers_left) + len(date_columns)
+                create_spinbox(r_start + 0, 'L2', sum(emp_p2 == 'L'), total_days_p2)
+                create_spinbox(r_start + 1, 'P2', sum(emp_p2 == 'P'), total_days_p2)
+                create_spinbox(r_start + 2, 'r2', sum(emp_p2 == 'r'), total_days_p2)
+                create_spinbox(r_start + 3, 'R2', sum(emp_p2 == 'R'), total_days_p2)
+                create_spinbox(r_start + 4, 'O2', 0, total_days_p2)
 
-        # 底下列的多列統計紅綠燈維持不變 (統計資料庫整張大表顯示)
+                rem_label_p2 = QLabel()
+                rem_label_p2.setAlignment(Qt.AlignCenter)
+                self.table.setCellWidget(real_row, r_start + 5, rem_label_p2)
+                self.remaining_labels[f"{emp_id}_p2"] = rem_label_p2
+
+            # 強制第一次計算與繪製
+            updater() 
+
+        # ==========================================
+        # 👑 最底下列：多列班別詳細統計與紅綠燈
+        # ==========================================
         last_row_start = len(pivot_df) + 1
+        
         for row_offset, (label, shift_codes) in enumerate(self.stats_rows):
             current_row = last_row_start + row_offset
-            for i in range(len(headers)):
+            
+            # 補滿底下的左側灰色方塊
+            for i in range(len(headers_left)):
                 item = QTableWidgetItem("")
                 item.setBackground(QColor("#E0E0E0"))
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable) 
                 self.table.setItem(current_row, i, item)
 
+            # 該班別每日人數計算與上色
             for col_idx, date in enumerate(date_columns):
                 col_data = pivot_df[date]
                 count = sum(col_data.isin(shift_codes))
+                
+                # 計算這些班別在 SHIFT_DEMANDS 裡的「最大需求人數上限」 (防呆：若沒設定預設為 1)
                 max_limit = sum(SHIFT_DEMANDS.get(sc, (0, 1))[1] for sc in shift_codes)
                 if max_limit == 0: max_limit = 1 
                 
@@ -582,42 +476,67 @@ class SchedulerDialog(QDialog):
                 item.setTextAlignment(Qt.AlignCenter)
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable) 
                 
+                # 🚦 紅綠燈判定機制
                 if count == 0:
-                    item.setBackground(QColor("#FFCDD2"))
-                    item.setForeground(QColor("#B71C1C"))
+                    item.setBackground(QColor("#FFCDD2")) # 淺紅背景
+                    item.setForeground(QColor("#B71C1C")) # 深紅字
                 elif count >= max_limit:
-                    item.setBackground(QColor("#C8E6C9"))
-                    item.setForeground(QColor("#1B5E20"))
+                    item.setBackground(QColor("#C8E6C9")) # 淺綠背景
+                    item.setForeground(QColor("#1B5E20")) # 深綠字
                 else:
-                    item.setBackground(QColor("#FFF9C4"))
-                    item.setForeground(QColor("#F57F17"))
+                    item.setBackground(QColor("#FFF9C4")) # 淺黃背景 (提醒未滿)
+                    item.setForeground(QColor("#F57F17")) # 深橘字
                     
                 font = QFont()
                 font.setBold(True)
-                font.setPointSize(11)
+                font.setPointSize(11) # 字體縮小一點，避免畫面太擁擠
                 item.setFont(font)
-                self.table.setItem(current_row, col_idx + len(headers), item)
+                
+                self.table.setItem(current_row, col_idx + len(headers_left), item)
 
+            # 補滿底下的右側灰色方塊 (跨出區塊)
+            if self.split_date:
+                r_start = len(headers_left) + len(date_columns)
+                for i in range(len(headers_right)):
+                    item = QTableWidgetItem("")
+                    item.setBackground(QColor("#E0E0E0"))
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable) 
+                    self.table.setItem(current_row, r_start + i, item)
+
+        # 欄位寬度固定設定
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.table.horizontalHeader().setDefaultSectionSize(75)
         self.table.verticalHeader().setDefaultSectionSize(35)
-        for i in range(len(headers)):
-            self.table.horizontalHeader().resizeSection(i, 60)      
+        
+        # 縮小特定設定區塊的寬度
+        for i in range(len(headers_left)):
+            self.table.horizontalHeader().resizeSection(i, 60)
+        if self.split_date:
+            r_start = len(headers_left) + len(date_columns)
+            for i in range(len(headers_right)):
+                self.table.horizontalHeader().resizeSection(r_start + i, 60)
+          
     def on_run_engine_clicked(self):
         start_date, end_date = self.get_selected_dates()
-        night_start, night_end = self.get_night_dates()
         
+        # 💡 [新增] 彈出發射控制台
         config_dialog = RunConfigDialog(self)
         if config_dialog.exec() != QDialog.Accepted:
-            return
+            return  # 如果使用者按取消或關閉視窗，就中止排班
             
+        # 取得使用者勾選的參數字典
         rule_config = config_dialog.get_config()
         
         leave_quotas = {}
+        # 🛡️ 安全取得左右兩側的 keys
+        all_keys = list(getattr(self, 'control_keys_left', ['L', 'P', 'r', 'R', 'O']))
+        if getattr(self, 'split_date', None):
+            all_keys.extend(getattr(self, 'control_keys_right', ['L2', 'P2', 'r2', 'R2', 'O2']))
+            
         for emp_id, widgets in self.leave_widgets.items():
             leave_quotas[emp_id] = {}
-            for k in self.control_keys:
+            for k in all_keys:
                 w = widgets.get(k)
                 if w is not None:
                     try:
@@ -631,38 +550,21 @@ class SchedulerDialog(QDialog):
                 else:
                     leave_quotas[emp_id][k] = 0
                     
-        self.engine = ScheduleEngine(self.db)
+        engine = ScheduleEngine(self.db)
         
-        # 建立來回滾動的進度視窗
-        self.progress_dialog = QProgressDialog("⚙️ 引擎正在全力運算中，請稍候...\n(若條件嚴苛可能需要數十秒至數分鐘)", "🛑 放棄本次運算", 0, 0, self)
-        self.progress_dialog.setWindowTitle("執行智能排班")
-        self.progress_dialog.setWindowModality(Qt.WindowModal)
-        self.progress_dialog.setMinimumDuration(0) 
-        self.progress_dialog.canceled.connect(self.cancel_engine) # 綁定取消事件
+        # 💡 [修改] 將 rule_config 傳入引擎
+        success, message = engine.run_scheduler(
+            start_date, 
+            end_date, 
+            leave_quotas, 
+            rule_config=rule_config  # 傳入設定
+        )
         
-        # 啟動背景執行緒
-        self.worker = EngineWorker(self.engine, start_date, end_date, night_start, night_end, leave_quotas, rule_config)
-        self.worker.finished_signal.connect(self.on_engine_finished)
-        self.worker.start()
-        
-        # 顯示視窗 (不使用 exec() 避免死鎖)
-        self.progress_dialog.show()
-
-    def cancel_engine(self):
-        """使用者按下取消按鈕，發送中斷訊號給引擎"""
-        if hasattr(self, 'engine'):
-            self.engine.cancel()
-        
-    def on_engine_finished(self, success, message):
-        """背景引擎執行完畢後的 Callback"""
-        if hasattr(self, 'progress_dialog'):
-            self.progress_dialog.close()
-            
         if success:
             QMessageBox.information(self, "排班結果", message)
             self.refresh_table() 
         else:
-            QMessageBox.warning(self, "排班結果", message)
+            QMessageBox.warning(self, "排班失敗", message)
 
     def on_debug_run_clicked(self):
         """執行暴力 Debug 排班前，先彈出分級人力診斷報告"""
@@ -670,6 +572,7 @@ class SchedulerDialog(QDialog):
         dates = pd.date_range(start=start_date, end=end_date).tolist()
         num_days = len(dates)
 
+        # 1. 取得主管與基層的每日班別上下限需求
         from config.settings import SHIFT_DEMANDS, MANAGER_ONLY_SHIFTS
         
         daily_min_m = sum(req[0] for s, req in SHIFT_DEMANDS.items() if s in MANAGER_ONLY_SHIFTS)
@@ -682,6 +585,7 @@ class SchedulerDialog(QDialog):
         cycle_min_n = daily_min_n * num_days
         cycle_max_n = daily_max_n * num_days
 
+        # 2. 依照職級篩選啟用人員
         active_employees = self.db.get_all_active_employees()
         managers = [e for e in active_employees if str(e.get('job_level', 'Normal')).strip() in ('M', 'Chief', 't')]
         normals = [e for e in active_employees if str(e.get('job_level', 'Normal')).strip() not in ('M', 'Chief', 't')]
@@ -692,17 +596,16 @@ class SchedulerDialog(QDialog):
         slots_m = num_m * num_days
         slots_n = num_n * num_days
 
-        manager_ids = [str(e['emp_id']).strip() for e in managers]
+        # 3. 從畫面的 SpinBox 收集休假與加班資料
         total_off_m = 0
         total_off_n = 0
         leave_quotas = {}
-        off_keys = ['L', 'P', 'r', 'R']  # O(加班) 不算休假
+        standard_keys = ['L', 'P', 'r', 'R', 'O']
             
         for emp_id, widgets in self.leave_widgets.items():
             eid_str = str(emp_id).strip()
             leave_quotas[eid_str] = {}
-            emp_off_days = 0
-            for k in self.control_keys:
+            for k in standard_keys:
                 w = widgets.get(k)
                 val = 0
                 if w is not None:
@@ -714,7 +617,8 @@ class SchedulerDialog(QDialog):
                         except (ValueError, TypeError):
                             val = 0
                 leave_quotas[eid_str][k] = val
-                if k in off_keys:
+                
+                if k in standard_keys:
                     emp_off_days += val
             
             if eid_str in manager_ids:
@@ -725,6 +629,7 @@ class SchedulerDialog(QDialog):
         avail_m = slots_m - total_off_m
         avail_n = slots_n - total_off_n
 
+        # 5. 組合分級分析報告與確認視窗
         msg = (f"📊 【分級人力配額物理試算】\n\n"
                f"📅 區間：{start_date} 至 {end_date} (共 {num_days} 天)\n"
                f"----------------------------------------\n"
@@ -754,6 +659,7 @@ class SchedulerDialog(QDialog):
         reply = QMessageBox.question(self, "暴力 Debug (無視法規)", msg, QMessageBox.Yes | QMessageBox.No)
         
         if reply == QMessageBox.Yes:
+            from engine.solver import ScheduleEngine
             engine = ScheduleEngine(self.db)
             try:
                 success, message = engine.run_scheduler(start_date, end_date, leave_quotas, debug_mode=True, rule_config={'strict_quotas': False, 'hard_mid_a': False, 'hard_no_4_off': False})
@@ -769,22 +675,11 @@ class SchedulerDialog(QDialog):
     def on_check_manpower_clicked(self):
         """僅顯示當前 QSpinBox 休假與人力統計資訊，並預檢硬規則衝突，不執行排班"""
         start_date, end_date = self.get_selected_dates()
-        night_start, night_end = self.get_night_dates()
-
         dates = pd.date_range(start=start_date, end=end_date).tolist()
         num_days = len(dates)
         eval_dates = [d.strftime('%Y-%m-%d') for d in dates]
-        night_dates = pd.date_range(start=night_start, end=night_end).strftime('%Y-%m-%d').tolist()
 
-        overall_start = min(start_date, night_start)
-        overall_end = max(end_date, night_end)
-
-        schedules = self.db.get_schedule_by_date_range(eval_dates[0], eval_dates[-1])
-        dict_sched = {(s['emp_id'], s['date']): s for s in schedules}
-        
-        overall_schedules = self.db.get_schedule_by_date_range(overall_start, overall_end)
-        dict_sched_overall = {(s['emp_id'], s['date']): s for s in overall_schedules}
-
+        # 1. 取得主管與基層的每日班別上下限需求
         from config.settings import SHIFT_DEMANDS, MANAGER_ONLY_SHIFTS
         
         daily_min_m = sum(req[0] for s, req in SHIFT_DEMANDS.items() if s in MANAGER_ONLY_SHIFTS)
@@ -792,19 +687,12 @@ class SchedulerDialog(QDialog):
         daily_min_n = sum(req[0] for s, req in SHIFT_DEMANDS.items() if s not in MANAGER_ONLY_SHIFTS)
         daily_max_n = sum(req[1] for s, req in SHIFT_DEMANDS.items() if s not in MANAGER_ONLY_SHIFTS)
         
-        # 👇 [新增] 切割出交集區間(重疊天數)與非交集區間
-        night_eval_dates = [d for d in eval_dates if d in night_dates]
-        night_outside_dates = [d for d in night_dates if d not in eval_dates]
-
-        # 👇 [修改] 抓出夜班的每日需求，改為乘以「重疊天數」
-        req_night_per_day = SHIFT_DEMANDS.get('01夜B1', [0,0])[0] + SHIFT_DEMANDS.get('01夜B2', [0,0])[0]
-        min_night_needed = req_night_per_day * len(night_eval_dates)
-
         cycle_min_m = daily_min_m * num_days
         cycle_max_m = daily_max_m * num_days
         cycle_min_n = daily_min_n * num_days
         cycle_max_n = daily_max_n * num_days
 
+        # 2. 依照職級篩選啟用人員 (M, Chief, t 納入主管戰力群)
         active_employees = self.db.get_all_active_employees()
         managers = [e for e in active_employees if str(e.get('job_level', 'Normal')).strip() in ('M', 'Chief', 't')]
         normals = [e for e in active_employees if str(e.get('job_level', 'Normal')).strip() not in ('M', 'Chief', 't')]
@@ -815,18 +703,26 @@ class SchedulerDialog(QDialog):
         slots_m = num_m * num_days
         slots_n = num_n * num_days
 
-        manager_ids = [str(e['emp_id']).strip() for e in managers]
+        # 3. 從畫面的 SpinBox 收集分級休假資料
         total_off_m = 0
         total_off_n = 0
-        total_night_quota = 0  # 👇 追蹤已經發出去的夜班數量
         leave_quotas = {}
-        off_keys = ['L', 'P', 'r', 'R']  # O(加班) 不算休假
+        
+        # 定義哪些狀態是純休假 (不包含 O 加班)
+        standard_keys = ['L', 'P', 'r', 'R', 'O']
+        all_off_keys = standard_keys[:-1]  # 最後一個 O 是加班，不算在休假天數裡
+
+        # 使用 list() 強制複製陣列，避免污染原生控制設定
+        all_keys = list(getattr(self, 'control_keys_left', ['L', 'P', 'r', 'R', 'O']))
+        if getattr(self, 'split_date', None):
+            all_keys.extend(getattr(self, 'control_keys_right', ['L2', 'P2', 'r2', 'R2', 'O2']))
+
+        manager_ids = [str(e['emp_id']).strip() for e in managers]
 
         for emp_id, widgets in self.leave_widgets.items():
             eid_str = str(emp_id).strip()
             leave_quotas[eid_str] = {}
-            emp_off_days = 0
-            for k in self.control_keys:
+            for k in standard_keys:
                 w = widgets.get(k)
                 val = 0
                 if w is not None:
@@ -838,33 +734,22 @@ class SchedulerDialog(QDialog):
                         except (ValueError, TypeError):
                             val = 0
                 leave_quotas[eid_str][k] = val
-                if k in off_keys:
-                    emp_off_days += val
                 
-                # 👇 累加夜班 QSpinBox 的總和
-                if k == '夜':
-                    total_night_quota += val
+                if k in all_off_keys:
+                    emp_off_days += val
             
+            # 分流加總休假天數
             if eid_str in manager_ids:
                 total_off_m += emp_off_days
             else:
                 total_off_n += emp_off_days
 
+        # 計算各級別實質可用人力
         avail_m = slots_m - total_off_m
         avail_n = slots_n - total_off_n
 
-        # 👇 [新增] 結算「夜班參照區間內」但「落在主運算區外」且已定案的夜班
-        already_night_total = 0
-        for d in night_outside_dates:
-            for e in active_employees:
-                record = dict_sched_overall.get((e['emp_id'], d))
-                if record and record['shift_code'] in ('01夜B1', '01夜B2'):
-                    already_night_total += 1
-                    
-        # 👇 實際可以給引擎在這段主運算區間內分配的夜班剩餘總額
-        effective_night_quota = total_night_quota - already_night_total
-
-        # 硬規則安檢探針
+        # 4. 跨境調用引擎的硬規則安檢探針
+        from engine.solver import ScheduleEngine
         emp_ids = [e['emp_id'] for e in active_employees]
         job_levels = {str(e['emp_id']).strip(): str(e['job_level']).strip() for e in active_employees}
         shift_prefs = {str(e['emp_id']).strip(): str(e.get('shift_pref', 'MIX')).strip() for e in active_employees}
@@ -881,9 +766,10 @@ class SchedulerDialog(QDialog):
         
         engine = ScheduleEngine(self.db)
         hard_conflicts = engine._run_pre_flight_diagnostics(
-            emp_ids, eval_dates, dict_sched, dict_history, job_levels, shift_prefs, leave_quotas, night_dates, dict_sched_overall
+            emp_ids, eval_dates, dict_sched, dict_history, job_levels, shift_prefs, leave_quotas
         )
 
+        # 5. 組合分級分析報告
         msg = (f"📊 【分級人力配額物理試算】\n\n"
                f"📅 區間：{start_date} 至 {end_date} (共 {num_days} 天)\n"
                f"----------------------------------------\n"
@@ -910,21 +796,6 @@ class SchedulerDialog(QDialog):
             msg += "⚠️ 警告：基層可工作天數超出全體基層班別最大容量！\n"
         else:
             msg += "✅ 評估：基層級總量正常。\n"
-            
-        # 👇 [修改] 顯示更精準的交集與剩餘額度資訊
-        msg += (f"\n----------------------------------------\n"
-                f"🌙 【夜班專屬配額試算】\n"
-                f"🎯 重疊運算區間 ({len(night_eval_dates)}天) 夜班總需求：{min_night_needed} 人次\n"
-                f"📥 QSpinBox 總發放配額：{total_night_quota} 人次\n"
-                f"🧮 扣除運算區外已消耗：{already_night_total} 人次\n"
-                f"💪 實際剩餘可用額度：{effective_night_quota} 人次\n")
-                
-        if effective_night_quota < min_night_needed:
-            msg += f"❌ 錯誤：夜班配額不足！還差 {min_night_needed - effective_night_quota} 個人次。引擎無人可用。\n"
-        elif effective_night_quota > min_night_needed:
-            msg += f"⚠️ 警告：剩餘額度過多 (多出 {effective_night_quota - min_night_needed} 人次)，將被強迫安插。\n"
-        else:
-            msg += f"✅ 評估：夜班剩餘額度完美吻合需求！\n"
 
         msg += "\n----------------------------------------\n"
         msg += "🚨 【預排班表與配額死結預檢】\n"
@@ -936,23 +807,29 @@ class SchedulerDialog(QDialog):
                 msg += f"  👉 {err}\n"
             if len(hard_conflicts) > 5:
                 msg += f"  ...等共 {len(hard_conflicts)} 項衝突。\n"
-            msg += "\n💡 提示：請先至主面板解除圖釘鎖定或調整 QSpinBox 配額！"
+            msg += "\n💡 提示：請先至主面板解除圖釘鎖定或調整 QSpinBox 例假天數！"
 
         QMessageBox.information(self, "分級人力與死結綜合試算 (不排班)", msg)
+
+
+    # 🔧 [功能二] 實作安全刪除邏輯
     def on_clear_schedule_clicked(self):
         """清空選定區間內所有未鎖定的排班資料"""
         start_date, end_date = self.get_selected_dates()
         
+        # 1. 🛡️ 宏觀防禦：如果整個月被關帳鎖定了，直接拒絕
         if self.db.is_period_locked(start_date, end_date):
             QMessageBox.critical(self, "🛑 操作被拒", f"指定區間 ({start_date} 至 {end_date}) 已被系統結算鎖定！\n請先至資料庫管理中心解鎖。")
             return
 
+        # 2. 詢問確認
         reply = QMessageBox.question(self, "確認清空班表", 
                                      f"您確定要清空 {start_date} 至 {end_date} 之間的所有自動排班嗎？\n\n💡 注意：這只會抹除引擎排出的班別，您匯入的歷史班表與鎖定的請假資料（📌圖釘）將會受到保護、維持原狀。",
                                      QMessageBox.Yes | QMessageBox.No)
         
         if reply == QMessageBox.Yes:
             try:
+                # 3. 執行 SQL 刪除 (僅針對 is_locked = 0)
                 conn = self.db.get_connection()
                 cursor = conn.cursor()
                 cursor.execute('''
@@ -969,7 +846,10 @@ class SchedulerDialog(QDialog):
                 QMessageBox.critical(self, "錯誤", f"刪除過程中發生異常：\n{str(e)}")
 
     def on_stats_clicked(self):
+        """開啟班別統計與負債檢核視窗"""
         start_date, end_date = self.get_selected_dates()
+        
+        # 實例化並開啟統計視窗 (傳入 db_manager 以及目前的日期區間)
         dialog = StatsDialog(self.db, start_date, end_date, self)
         dialog.exec()
 
@@ -980,57 +860,76 @@ class SchedulerDialog(QDialog):
             QMessageBox.warning(self, "匯出失敗", "選定區間內沒有排班資料可匯出！")
             return
 
-        # 啟動預覽與修改視窗
-        dialog = ExportPreviewDialog(self.db, start_date, end_date, self)
-        
-        # 若使用者在修改視窗點擊「確認並匯出」
-        if dialog.exec() == QDialog.Accepted:
-            # 選擇存檔路徑
-            file_path, _ = QFileDialog.getSaveFileName(self, "匯出班表", f"排班表_{start_date}_至_{end_date}.xlsx", "Excel Files (*.xlsx)")
-            if file_path:
-                try:
-                    # 直接匯出剛剛視窗中已更新的 pivot_df
-                    dialog.pivot_df.to_excel(file_path)
+        file_path, _ = QFileDialog.getSaveFileName(self, "匯出班表", f"排班表_{start_date}_至_{end_date}.xlsx", "Excel Files (*.xlsx)")
+        if file_path:
+            try:
+                # 1. 取得員工的職級資料字典，用於後續排序
+                employees = self.db.get_all_active_employees()
+                level_dict = {str(e['emp_id']).strip(): str(e['job_level']).strip() for e in employees}
 
-                    import openpyxl
-                    from openpyxl.styles import PatternFill
-                    
-                    wb = openpyxl.load_workbook(file_path)
-                    ws = wb.active
-                    
-                    c_shift_fill = PatternFill(start_color="CCC0DA", end_color="CCC0DA", fill_type="solid")
-                    
-                    for row in ws.iter_rows(min_row=2, min_col=2):
-                        for cell in row:
-                            if isinstance(cell.value, str) and cell.value.endswith('c'):
-                                cell.fill = c_shift_fill
-                                
-                    wb.save(file_path)
-                    QMessageBox.information(self, "匯出成功", f"檔案已儲存至：\n{file_path}\n\n✅ 您所做的班別修改已同步儲存至資料庫中。")
-                    
-                    # 重新整理主畫面的排班表，使其與剛才的修改結果同步
-                    self.refresh_table()
-                except Exception as e:
-                    QMessageBox.critical(self, "匯出失敗", f"寫入 Excel 時發生錯誤：\n{str(e)}")
+                # 2. 將排班表轉為 DataFrame 並建立透視表
+                df = pd.DataFrame(schedules)
+                pivot_df = df.pivot(index='emp_id', columns='date', values='shift_code').fillna('')
+                pivot_df.index = pivot_df.index.astype(str).str.strip()
 
+                # 3. 依照職級排序 (Chief > M > Normal) -> 相同職級則依照員編排序
+                def sort_key(emp_id):
+                    level = level_dict.get(emp_id, 'Normal')
+                    if level == 'Chief': 
+                        return (0, emp_id)
+                    elif level == 'M': 
+                        return (1, emp_id)
+                    else: 
+                        return (2, emp_id)
+
+                sorted_emp_ids = sorted(pivot_df.index, key=sort_key)
+                pivot_df = pivot_df.reindex(sorted_emp_ids)
+
+                # 4. 匯出基礎 Excel 檔案
+                pivot_df.to_excel(file_path)
+
+                # 5. 💡 使用 openpyxl 進行後期加工：標記 c 班底色
+                import openpyxl
+                from openpyxl.styles import PatternFill
+                
+                wb = openpyxl.load_workbook(file_path)
+                ws = wb.active
+                
+                # 將 RGB(204, 192, 218) 轉為 Hex 色碼為 CCC0DA
+                c_shift_fill = PatternFill(start_color="CCC0DA", end_color="CCC0DA", fill_type="solid")
+                
+                # 掃描所有的儲存格，尋找結尾為 'c' 的班別
+                for row in ws.iter_rows(min_row=2, min_col=2): # 跳過標題列(row=1)與員編欄(col=1)
+                    for cell in row:
+                        if isinstance(cell.value, str) and cell.value.endswith('c'):
+                            cell.fill = c_shift_fill
+                            
+                # 存檔覆蓋
+                wb.save(file_path)
+
+                QMessageBox.information(self, "匯出成功", f"檔案已儲存至：\n{file_path}")
+            except Exception as e:
+                QMessageBox.critical(self, "匯出失敗", f"寫入錯誤：\n{str(e)}")
+
+    # 🔧 [功能一] 關閉視窗時，釘死排班中心的自選日期
     def closeEvent(self, event):
         start_date_str = self.date_start.date().toString("yyyy-MM-dd")
         end_date_str = self.date_end.date().toString("yyyy-MM-dd")
-        night_start_str = self.night_date_start.date().toString("yyyy-MM-dd")
-        night_end_str = self.night_date_end.date().toString("yyyy-MM-dd")
-
         self.settings.setValue("scheduler_start_date", start_date_str)
         self.settings.setValue("scheduler_end_date", end_date_str)
-        self.settings.setValue("scheduler_night_start", night_start_str)
-        self.settings.setValue("scheduler_night_end", night_end_str)
         super().closeEvent(event)
 
+    #呼叫DataImporter的預排班表匯入功能
     def on_import_pre_schedule_clicked(self):
+        """從 Excel 匯入預排班表 (呼叫 data_importer 統一處理)"""
         file_path, _ = QFileDialog.getOpenFileName(self, "選擇預排 Excel 檔案", "", "Excel Files (*.xlsx *.xls)")
         if not file_path:
             return
             
+        # 💡 使用 UI 面板上設定的「目標運算區間」起始日，作為 Excel 表格第 1 天的對應日期
         start_date = self.date_start.date().toString("yyyy-MM-dd")
+        
+        # 實例化 DataImporter 並傳入共用的 db_manager
         importer = DataImporter(self.db)
         success, message = importer.import_pre_schedule(file_path, start_date)
         
@@ -1040,7 +939,9 @@ class SchedulerDialog(QDialog):
         else:
             QMessageBox.critical(self, "匯入失敗", message)
 
+
     def on_clear_pre_schedule_clicked(self):
+        """清除當前選定日期區間內，所有的鎖定預排班表"""
         start_date, end_date = self.get_selected_dates()
         
         reply = QMessageBox.question(
@@ -1053,6 +954,7 @@ class SchedulerDialog(QDialog):
             conn = self.db.get_connection()
             cursor = conn.cursor()
             
+            # 只解鎖該區間內 is_locked = 1 的格子，清空其內容
             cursor.execute('''
                 UPDATE schedule 
                 SET is_locked = 0, shift_code = NULL 

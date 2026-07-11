@@ -146,7 +146,6 @@ class ScheduleEngine:
                 if record and record['shift_code'] in ('01夜B1', '01夜B2'):
                     already_night_total += 1
 
-        from config.settings import SHIFT_DEMANDS
         req_night_per_day = SHIFT_DEMANDS.get('01夜B1', [0,0])[0] + SHIFT_DEMANDS.get('01夜B2', [0,0])[0]
         # 只算主運算區間且涵蓋在參照區間內的日子需求
         min_night_needed = req_night_per_day * len(night_eval_dates)
@@ -1050,7 +1049,7 @@ class ScheduleEngine:
             solver.parameters.max_time_in_seconds = 600.0 
             # 👇 開啟多核心平行運算 (例如設定為 4 或 8 核心，視你的硬體而定)
             # 預設為 1 核心，開啟後對於複雜的排班限制解題速度會有顯著提升
-            solver.parameters.num_search_workers = 3  # 可依硬體調整，建議不要超過 CPU 核心數
+            solver.parameters.num_search_workers = 16  # 可依硬體調整，建議不要超過 CPU 核心數
 
             # 👇 加入這兩行開啟底層日誌
             solver.parameters.log_search_progress = True
